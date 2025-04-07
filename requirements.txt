@@ -1,0 +1,10 @@
+pymysql
+re
+langgraph
+mistralai
+python-dotenv
+langchain
+langchain_mistralai
+langchain_core
+langchain_text_splitters
+logging
