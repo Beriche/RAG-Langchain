@@ -10,6 +10,10 @@ import json
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("streamlit_app")
 
+#  variable d'état
+if 'app_mode' not in st.session_state:
+    st.session_state.app_mode = "general"  # Valeurs possibles: "general" ou "dossier"
+    
 
 #import du module RAG 
 try:
@@ -235,7 +239,7 @@ def load_chat_history(filename: str) -> bool:
 #Fonction pour traiter la question de l'instructeur 
 def process_user_query(query: str)->str:
     """ 
-        Traite la question de l'utilisateur en utilisant le système RAG.
+        Traite la question de l'utilisateur .
         
         Args:
             query (str): La question posée par l'utilisateur
@@ -259,20 +263,36 @@ def process_user_query(query: str)->str:
         
         #intégrer le dossier actif dans le contexte si disponible 
         context = []
+        
+        # Si un dossier est actif, l'ajouter  au contexte
         if st.session_state.active_dossier:
+            dossier_id = st.session_state.active_dossier.get("Numero","N/A")
+            
+            if "dossier" not in query.lower() and dossier_id not in query: 
+                enhanced_query = f"Concernant spécifiquement le dossier {dossier_id}: {query}"
+            else:
+                enhanced_query = query
+            
+             # Ajouter les informations du dossier actif au contexte
             context.append({
                 "type": "active_dossier",
-                "dossier_id": st.session_state.active_dossier.get("id"),
-                "dossier_data": st.session_state.active_dossier
+                "dossier_id": dossier_id,
+                "dossier_data": st.session_state.active_dossier,
+                "is_primary_context": True # Flag pour indiquer que ce contexte est prioritaire
             })
+            
+            logger.info(f"Question traitée avec le dossier actif #{dossier_id}")
+        else:
+            enhanced_query = query
     
-        #etat inital pour le graph
+        #Etat inital pour le graph
         initial_state = {
-            "question":query,
+            "question":enhanced_query,
             "context": context,
-            "db_results": [],
+            "db_results": [st.session_state.active_dossier] if st.session_state.active_dossier else [],
             "answer": "",
-            "history": st.session_state.chat_history[-5:] if len(st.session_state.chat_history) > 0 else []
+            "history": st.session_state.chat_history[-5:] if len(st.session_state.chat_history) > 0 else [],
+            "force_dossier_id": dossier_id if st.session_state.active_dossier else None  # Forcer l'utilisation de ce dossier
         }
         
         #executer le graphe avec timeout pour eviter les blocages
@@ -285,13 +305,18 @@ def process_user_query(query: str)->str:
         #sauvegarder les résulats pour les afficher 
         st.session_state.last_result = result
         
+        if st.session_state.active_dossier:
+            dossier_prefix = f"📋 *Information concernant le dossier {dossier_id}:*\n\n"
+            return dossier_prefix + result["answer"]
         
-        #enrichir la réponse avec les métadonnées
-        if result.get("db_results") and st.session_state.show_db_results:
+        #Enrichir la réponse avec les métadonnées
+        elif result.get("db_results") and st.session_state.show_db_results:
             dossier_info = f"\n\n*Informations trouvées dans {len(result['db_results'])} dossier(s)*"
             return result["answer"] + dossier_info
+        
         else:
             return result["answer"]
+        
     except Exception as e:
         error_msg = f"Une erreur s'est produite lors du traitement de votre demande:  {str(e)}"
         logger.error(f"Erreur de traitement de la requête: {e}",exc_info=True)
@@ -319,7 +344,7 @@ def search_dossier(dossier_id: str)-> Optional[Dict]:
         return None 
     
     try:
-        #Récuperer la fonction de recherche de dossier du module RAG 
+        # Récuperer la fonction de recherche de dossier du module RAG 
         search_function = st.session_state.rag_components.get("rechercher_dossier")
         
         
@@ -328,14 +353,22 @@ def search_dossier(dossier_id: str)-> Optional[Dict]:
             return None 
         
         # Effectuer la recherche 
-        result = search_function(dossier_id)
+        results = search_function(dossier_id)
         
-        #stocker le resultat comme dossier actif
         
-        if result:
+        
+        #Verifie si un dossier à ete retrouver
+        if results and len(results) > 0:
+            #prendre le premier resultat
+            result = results[0]
+            
+            #stocker le resultat comme dossier actif
             st.session_state.active_dossier = result
             
-        return result
+            return result
+        else:
+            st.warning(f"Aucun dossier trouvé avec l'identifiant {dossier_id}.")
+            return None 
     
     except Exception as e:
         logger.error(f"Erreur lors de la recherche du dossier : {e}",exc_info=True)
@@ -368,6 +401,9 @@ def display_source(source, index):
     st.markdown("---")
     
 #===== INTERFACE PRINCIPALE ====
+# Ajouter des onglets en haut de l'interface principale
+mode_tabs = st.tabs(["💬 Questions Générales", "📁 Consultation de Dossier"])
+
 #Titre principal avec indicateur d'état du système 
 col1,col2 = st.columns([3,1])
 with col1:
@@ -431,6 +467,8 @@ with st.sidebar:
                     })
                     st.bar_chart(chart_data.set_index('Categorie'))
                     
+              
+                    
     #Option d'afichage regroupées
     with st.expander("⚙️ Options d'affichage", expanded=True):
         st.session_state.show_sources = st.checkbox("Afficher les sources citées", value=st.session_state.show_sources)
@@ -478,7 +516,17 @@ with st.sidebar:
         if st.button("Effacer ce message"):
             st.session_state.error_message = None 
             st.experimental_rerun()
-            
+  
+# Premier onglet : Questions générales
+with mode_tabs[0]:
+    if st.session_state.app_mode != "general":
+        st.session_state.app_mode = "general"
+        st.session_state.active_dossier = None  # Désactiver tout dossier actif
+        st.rerun()
+    
+    st.subheader("Questions sur le dispositif KAP Numérique")
+    
+     
 #Zone d'affichage des messages du chat avec scrolling
 st.subheader("💬 Conversation")
 chat_container = st.container(height=400)
@@ -492,11 +540,36 @@ with chat_container:
                 st.chat_message("user",avatar="👤").write(message["content"])
             else:
                 with st.chat_message("assistant", avatar="🤖"):
-                    st.write(message["content"])
+                    content = st.write(message["content"])
+                    
+                    # On verifie si content est une chaîne de caractères
+                    if not isinstance(content, str):
+                        content = str(content) if content is not None else ""
+                    
+                    # Vérifier si ce message concerne un dossier spécifique
+                    # Par celle-ci (avec une vérification du type)
+                    # Vérifier si ce message concerne un dossier spécifique
+                    is_dossier_message = "dossier" in content.lower() and any(str(i) in content for i in range(10))
+                    
+                    
+                    if is_dossier_message:
+                        # Ajouter un style pour les messages concernant un dossier
+                        st.markdown(f"""
+                        <div style="border-left: 4px solid #28a745; padding-left: 10px;">
+                            {content}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.write(content)
+                    
+                     # Afficher le badge de dossier actif
+                    if st.session_state.active_dossier:
+                        dossier_id = st.session_state.active_dossier.get('Numero','N/A')
+                        st.caption(f"🟢 Dossier actif: #{dossier_id}")
                     
                     #si c'est le dernier message de l'assistant et qu'il y'a un dossier actif 
                     if i==len(st.session_state.chat_history) -1 and st.session_state.active_dossier:
-                        st.caption(f"Dossier actif: #{st.session_state.active_dossier.get('id','N/A')}")
+                        st.caption(f"Dossier actif: #{st.session_state.active_dossier.get('Numero','N/A')}")
                         
 #Affichage des destails du dossier s'il y'en a et si l'option est activée
 if(st.session_state.get('show_db_results',True) and 
@@ -539,13 +612,15 @@ if(st.session_state.get('show_db_results',True) and
                 if st.button("Définir comme dossier actif", key="set_active"):
                     if len(db_results) > 0:
                         st.session_state.active_dossier = db_results[0]
-                        st.success(f"Dossier #{db_results[0].get('id', 'N/A')} défini comme dossier actif")
+                        st.success(f"Dossier #{db_results[0].get('Numero', 'N/A')} défini comme dossier actif")
                         st.rerun()
             
             with col2:
-                if st.button("Poser une question sur ce dossier", key="ask_about"):
+                if st.button("Poser une question sur ce dossier", key="ask_details"): 
+                    # Définir le dossier comme actif
+                    
                     if len(db_results) > 0:
-                        dossier_id = db_results[0].get('id', 'inconnu')
+                        dossier_id = db_results[0].get('Numero', 'inconnu')
                         st.session_state.active_dossier = db_results[0]
                         # Ajouter une question prédéfinie à l'historique
                         question = f"Résume-moi le dossier #{dossier_id}"
@@ -555,7 +630,7 @@ if(st.session_state.get('show_db_results',True) and
             st.info("Aucune information de dossier disponible pour cette requête.")
     
 # Zone de saisie pour la question de l'utilisateur avec instructions
-st.markdown("### Posez votre question ici :")
+st.markdown("### Posez votre question !!")
 
 # Suggestions de questions rapides
 quick_questions = [
@@ -606,26 +681,43 @@ st.subheader("🔍 Recherche rapide de dossier")
 col1,col2,col3 = st.columns([3,1,1])
 
 with col1:
-    dossier_number = st.text_input("Numéro de dossier (ex: 82-2069)",key="dossier_search",placeholder="Entrez le numéro du dossier..."),
+    dossier_number = st.text_input("Numéro de dossier (ex: 82-2069)",key="dossier_search",placeholder="Entrez le numéro du dossier...")
     
 with col2:
     search_button = st.button("🔎 Rechercher", use_container_width=True, disabled=not st.session_state.initialized or not dossier_number)
     
 with col3:
-    if st.session_state.active_dossier:
+     if st.session_state.active_dossier:
          if st.button("❌ Effacer dossier actif", use_container_width=True):
              st.session_state.active_dossier = None 
              st.rerun()
     
 #traitement de la recherche de dossier
-if search_dossier:
+if search_button and dossier_number:
     result = search_dossier(dossier_number)
     
     if result:
         st.success(f"Dossier  {dossier_number} trouvé !")
         
-        #Afficher un aperçu des informations du dossier dans un format compact
+        # Ajout d'un badge visuel en haut de la section dossier
+        st.markdown("""
+            <div style="
+                background-color: #d4edda;
+                color: #155724;
+                padding: 10px;
+                border-radius: 5px;
+                margin-bottom:20px;
+                display:flex;
+                align-items:center; 
+            ">
+            <span style="font-weight:bold; margin-right:10px;">🟢 DOSSIER ACTIF</span>
+            <span>Toutes les questions posées concerneront ce dossier jusqu'à ce que vous en sélectionniez un autre ou le désactiviez.</span>
         
+        """,unsafe_allow_html=True)
+        
+        
+        
+        #Afficher un aperçu des informations du dossier dans un format compact
         col1,col2,col3,col4,col5,col6,col7 = st.columns(7)
         
         with col1:
@@ -658,7 +750,7 @@ if search_dossier:
                 st.session_state.chat_history.append({"role":"user","content":question})
                 st.rerun()
     else:
-        st.warning(f"Aucun dossier trouvé avec l'identifiant {dossier_number}.")
+        st.warning(f"Aucun dossier trouvé avec l'identifiant {dossier_number}")
         
 #Section d'affichage des sources si activée 
 if(st.session_state.get('show_sources',True) and 

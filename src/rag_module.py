@@ -1,8 +1,10 @@
 import os 
 import pymysql
 import re
+import hashlib
+import pickle
 from langgraph.graph import END, START
-from typing import List, TypedDict, Dict, Any, Optional
+from typing import List, TypedDict, Dict, Any, Optional,Tuple
 from mistralai import Mistral
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -13,6 +15,9 @@ from langchain import hub
 from langgraph.graph import StateGraph
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain.vectorstores import FAISS
+from langchain_core.embeddings import Embeddings
+from langchain_core.vectorstores import VectorStore
 import logging
 
 # Configuration du logging
@@ -32,6 +37,7 @@ OFFICIAL_DOCS_PATH = os.path.join(DATA_ROOT, "docs_officiels")
 vector_store = None
 llm = None
 embeddings = None
+
 
 # Définition de l'état de l'application
 class State(TypedDict):
@@ -93,6 +99,133 @@ class DatabaseManager:
             logger.error(f"Erreur de recherche : {erreur}")
             return []
 
+
+#Optimisation du système en stockant les embedding dans mon disque dur avec FAISS au lieu de la RAM avec inMemoryVectoreStore dans la RAM qui ralentit considérablement mon système RAG
+
+def calculate_documents_hash(documents: List[Document]) -> str:
+    """ 
+    Calcul un hash unique pour l'ensemble des documents.
+    
+    Args:
+        documents: Liste des documents à hacher
+         
+    Returns:
+        str: Hash SHA-256 représentant l'état actuel des documents
+        
+    """
+    
+    content = ""
+    
+    #On trie d'abord les documents par contenu pour assurer la consistance du hash 
+    for doc in sorted(documents,key=lambda x: x.page_content):
+        content += doc.page_content
+        #Ajouter les métadonnées au contenu à hacher
+        if doc.metadata:
+            content += str(sorted(doc.metadata.items()))
+    
+    return hashlib.sha256(content.encode()).hexdigest()
+
+def load_cached_embeddings( documents: List[Document],embeddings:Embeddings,cache_dir: str = "./cache") -> Tuple[Optional[VectorStore],str]:
+    """
+    Charge les embeddings depuis le cache s'ils existent et sont valides.
+    
+    Args:
+        documents: Liste des documents
+        embeddings: Modèle d'embeddings à utiliser
+        cache_dir: Répertoire où stocker le cache
+        
+    Returns:
+        Tuple[Optional[VectorStore], str]: Le vectorstore chargé et le hash des documents, ou (None, hash) si pas de cache valide
+    """
+    
+    # On créer le répertoire de cache s'il n'existe pas 
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    #calcule le hash des documents courants
+    current_hash = calculate_documents_hash(documents)
+    hash_file_path = os.path.join(cache_dir, "documents_hash.txt")
+    faiss_index_path = os.path.join(cache_dir, "faiss_index")
+    
+    # Puis on verifie si le hash correspond , charger l'index FAISS
+    
+    if os.path.exists(hash_file_path) and os.path.exists(faiss_index_path):
+        #Charger le hash precedent
+        
+        with open(hash_file_path, "r" ) as f:
+            cached_hash = f.read().strip() 
+            
+        # si le hash correspond , charger l'index FAISS
+        if cached_hash == current_hash:
+            try:
+                vector_store = FAISS.load_local(faiss_index_path,embeddings,  allow_dangerous_deserialization=True)
+                logger.info("Index FAISS chargé depuis le cache avec succès")
+                return vector_store,current_hash
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement de l'index FAISS: {e}")
+                return None,current_hash
+            
+    return None, current_hash
+
+def save_embeddings_cache(vector_store: VectorStore,documents_hash:str,cache_dir:str = "./cache"):
+    """
+    Sauvegarde les embeddings et le hash des documents dans le cache.
+    
+    Args:
+        vector_store: Le vectorstore à sauvegarder
+        documents_hash: Le hash des documents
+        cache_dir: Répertoire où stocker le cache
+    """
+    
+    # Créer le répertoire de cache s'il n'existe pas 
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Sauvegarder le hash des documents
+    hash_file_path = os.path.join(cache_dir, "documents_hash.txt")
+    with open(hash_file_path, "w") as f:
+        f.write(documents_hash)
+    
+    # Sauvegarder l'index FAISS
+    faiss_index_path = os.path.join(cache_dir, "faiss_index")
+    if hasattr(vector_store,"save_local"):
+        vector_store.save_local(faiss_index_path)
+    else: 
+        # Fallback pour InMemoryVectorStore qui ne supporte pas save_local
+        with open(os.path.join(cache_dir, "vector_store.pkl"), 'wb') as f:
+            pickle.dump(vector_store, f)
+
+def create_optimized_vector_store(documents: List[Document], embeddings: Embeddings, cache_dir: str = "./cache") -> VectorStore:
+        """
+            Crée un vectorstore optimisé avec cache pour les embeddings.
+            
+            Args:
+                documents: Liste des documents à indexer
+                embeddings: Modèle d'embeddings à utiliser
+                cache_dir: Répertoire où stocker le cache
+                
+            Returns:
+                VectorStore: Le vectorstore créé ou chargé depuis le cache
+         """
+    
+        # Essayer de charger depuis le cache 
+        vector_store, documents_hash = load_cached_embeddings(documents, embeddings, cache_dir)
+        
+        #si le cache est valide, utiliser le vectorestore chargé
+        if vector_store is not None:
+            print("Utilisation des embeddings en cache.")
+            return vector_store
+        
+        #Sinon, créer un nouveau vectorstore3
+        print("Calcul des nouveaux embeddings...")
+           # On utilise FAISS au lieu de InMemoryVectorStore pour permettre la sauvegarde sur disque
+        vector_store = FAISS.from_documents(documents, embeddings)
+        
+        # Sauvegarder les embeddings et le hash des documents dans le cache
+        save_embeddings_cache(vector_store, documents_hash, cache_dir)
+        print("Embeddings sauvegardés dans le cache.")
+        
+        return vector_store
+           
+#Initialisation de mon RAG
 def init_rag_system():
     """Initialise le système RAG complet et retourne les composants nécessaires."""
     global vector_store, llm, embeddings
@@ -102,6 +235,8 @@ def init_rag_system():
     # Initialiser le modèle LLM
     llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
     logger.info("Modèle LLM initialisé.")
+    
+    
     
     # Initialiser les embeddings
     embeddings = MistralAIEmbeddings()
@@ -116,8 +251,7 @@ def init_rag_system():
     logger.info(f"{len(all_splits)} chunks créés à partir des documents.")
     
     # Créer le vectorstore
-    vector_store = InMemoryVectorStore(embedding=embeddings)
-    vector_store.add_documents(all_splits)
+    vector_store = create_optimized_vector_store(all_splits, embeddings)
     logger.info("Vectorstore créé et documents ajoutés.")
     
     # Tester la connexion à la base de données
@@ -133,7 +267,8 @@ def init_rag_system():
         "vector_store": vector_store,
         "llm": llm,
         "graph": graph,
-        "db_connected": db_connected
+        "db_connected": db_connected,
+        "rechercher_dossier": db_manager.rechercher_dossier  # va etre exloiter dans l'applicaiton app.py pour la rechereche de dossier 
     }
 
 def extract_dossier_number(question: str) -> List[str]:
@@ -300,9 +435,44 @@ def retrieve(state: State) -> Dict[str, Any]:
         # Combiner les documents de la base de données et les documents du vectorstore
         combined_docs = db_docs + retrieved_docs
         
+        # Prioritisation des documents liés au dossier actif si un dossier est forcé
+        if state.get("force_dossier_id"):
+            dossier_id = state["force_dossier_id"]
+            logger.info(f"Priorisation des documents pour le dossier {dossier_id}")
+            
+            # Filtrer les documents pour mettre en avant ceux du dossier actif
+            prioritized_docs = []
+            other_docs = []
+            
+            for doc in combined_docs:
+                # Vérifier si le document est lié au dossier actif
+                is_target_dossier = (
+                    doc.metadata.get("numéro") == dossier_id or 
+                    doc.metadata.get("Numero") == dossier_id or
+                    doc.metadata.get("dossier_id") == dossier_id or
+                    ("content" in dir(doc) and dossier_id in doc.page_content)
+                )
+                
+                if is_target_dossier:
+                    # Ajouter un indicateur dans les métadonnées pour marquer ce document comme prioritaire
+                    doc.metadata["is_primary_context"] = True
+                    prioritized_docs.append(doc)
+                else:
+                    other_docs.append(doc)
+            
+            # Recombiner les documents avec ceux du dossier actif en premier
+            combined_docs = prioritized_docs + other_docs
+            
+            logger.info(f"{len(prioritized_docs)} documents spécifiques au dossier {dossier_id} priorisés")
+        
+        # Limiter le nombre total de documents pour éviter des problèmes de contexte trop volumineux
+        max_docs = 10  # Ajustez selon vos besoins
+        if len(combined_docs) > max_docs:
+            combined_docs = combined_docs[:max_docs]
+            
         return {"context": combined_docs}
     except Exception as e:
-        logger.error(f"Erreur dans la fonction retrieve: {e}")
+        logger.error(f"Erreur dans la fonction retrieve: {e}", exc_info=True)
         return {"context": []}
 
 def generate(state: State) -> Dict[str, Any]:
@@ -318,6 +488,26 @@ def generate(state: State) -> Dict[str, Any]:
         # Vérifier si le contexte est vide
         if not state["context"]:
             return {"answer": "Je n'ai pas trouvé d'informations pertinentes pour répondre à votre question."}
+        
+        # filtrer et prioriser spécifiquement le dossier actif
+        if state.get("force_dossier_id"):
+            # Filtrer le contexte pour ne garder que les documents liés au dossier actif
+            dossier_id = state["force_dossier_id"]
+            filtered_context = []
+            
+            # D'abord ajouter les documents qui correspondent exactement au dossier actif
+            
+            for doc in state["context"]:
+                if doc.metadata.get("numéro") == dossier_id or (
+                    "dossier_id" in doc.metadata and doc.metadata["dossier_id"] == dossier_id
+                ):
+                    filtered_context.append(doc)
+    
+            # Si aucun document spécifique n'est trouvé, utiliser tout le contexte
+            if filtered_context:
+                state["context"] = filtered_context
+            
+                        
         
         # Agrégation du contenu des documents récupérés avec détails sur les sources
         docs_details = []
@@ -357,6 +547,7 @@ def generate(state: State) -> Dict[str, Any]:
         
         # Instructions système pour le LLM
         system_instructions = (
+            
             "Tu es un instructeur expert du dispositif KAP Numérique. Tu réponds à des questions en te basant uniquement sur les informations fournies dans le contexte.\n\n"
             
             "Consignes de réponse :\n"
@@ -384,6 +575,14 @@ def generate(state: State) -> Dict[str, Any]:
             
             "8. Cites systématiquement les sources avec le format suivant : [Document: Nom du document, Catégorie: Type de document, Section: Nom de la section, Page: Numéro de page, Mise à jour: Date].\n"
         )
+        
+        #dossier spécifique
+        if state.get("force_dossier_id"):
+            system_instructions += (
+                f"\nATTENTION : Cette question concerne SPÉCIFIQUEMENT le dossier numéro {state['force_dossier_id']}. "
+                f"Concentre-toi UNIQUEMENT sur les informations concernant ce dossier et ignore les informations "
+                f"relatives à d'autres dossiers, même si elles semblent pertinentes."
+     )
         
         # Construction de l'invite utilisateur
         user_prompt = f"Question: {state['question']}\n\nContexte extrait des documents et de la base de données:\n{docs_content}"
