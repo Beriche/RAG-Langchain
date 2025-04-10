@@ -1,2 +1,2 @@
 # RAG-Langchain
-Création d'un système RAG en utilisant langchain
+Création d'un Chatbot ia basé sur une architecture RAG
