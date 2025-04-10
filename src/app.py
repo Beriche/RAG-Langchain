@@ -12,7 +12,7 @@ logger = logging.getLogger("streamlit_app")
 
 #  variable d'état
 if 'app_mode' not in st.session_state:
-    st.session_state.app_mode = "general"  # Valeurs possibles: "general" ou "dossier"
+    st.session_state.app_mode = "general"  
     
 
 #import du module RAG 
