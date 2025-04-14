@@ -329,39 +329,7 @@ def retrieve(state: State) -> Dict[str, Any]:
         
         # Étape 4: Combiner les documents
         combined_docs = db_docs + retrieved_docs
-        
-        # Étape 5: Prioriser les documents liés au dossier actif si spécifié
-        if state.get("force_dossier_id"):
-            dossier_id = state["force_dossier_id"]
-            logger.info(f"Priorisation des documents pour le dossier {dossier_id}")
-            
-            prioritized_docs = []
-            other_docs = []
-            
-            for doc in combined_docs:
-                # Vérifier si le document est lié au dossier actif
-                is_target_dossier = (
-                    doc.metadata.get("numéro") == dossier_id or 
-                    doc.metadata.get("Numero") == dossier_id or
-                    doc.metadata.get("dossier_id") == dossier_id or
-                    dossier_id in doc.page_content
-                )
-                
-                if is_target_dossier:
-                    doc.metadata["is_primary_context"] = True
-                    prioritized_docs.append(doc)
-                else:
-                    other_docs.append(doc)
-            
-            # Recombiner avec les documents prioritaires en premier
-            combined_docs = prioritized_docs + other_docs
-            logger.info(f"{len(prioritized_docs)} documents spécifiques au dossier {dossier_id} priorisés")
-        
-        # Étape 6: Limiter le nombre total de documents
-        max_docs = 10
-        if len(combined_docs) > max_docs:
-            combined_docs = combined_docs[:max_docs]
-            
+    
         return {"context": combined_docs}
     except Exception as e:
         logger.error(f"Erreur dans la fonction retrieve: {e}", exc_info=True)
@@ -381,20 +349,8 @@ def generate(state: State) -> Dict[str, Any]:
         if not state["context"]:
             return {"answer": "Je n'ai pas trouvé d'informations pertinentes pour répondre à votre question."}
         
-        # Étape 3: Filtrer le contexte pour le dossier actif si spécifié
-        if state.get("force_dossier_id"):
-            dossier_id = state["force_dossier_id"]
-            filtered_context = [
-                doc for doc in state["context"]
-                if doc.metadata.get("numéro") == dossier_id or 
-                   doc.metadata.get("dossier_id") == dossier_id
-            ]
-            
-            # Si des documents spécifiques sont trouvés, remplacer le contexte
-            if filtered_context:
-                state["context"] = filtered_context
-        
-        # Étape 4: Préparer les détails des documents pour le contexte
+      
+        # Étape 3: Préparer les détails des documents pour le contexte
         docs_details = []
         for doc in state["context"]:  
             source = doc.metadata.get("source", "Source inconnue")
@@ -421,21 +377,21 @@ def generate(state: State) -> Dict[str, Any]:
                 "category": category
             })
 
-        # Étape 5: Agréger le contenu des documents
+        # Étape 4: Agréger le contenu des documents
         docs_content = "\n\n".join(doc["content"] for doc in docs_details)
 
-        # Étape 6: Formater les sources
+        # Étape 5: Formater les sources
         formatted_sources = "\n".join([
             f"[Document: {doc['file_name']}, Catégorie: {doc['category']}, Section: {doc['section']}, Page: {doc['page']}, Mise à jour: {doc['update_date']}]"
             for doc in docs_details
         ])
         
-        # Étape 7: Définir les instructions pour le LLM
+        # Étape 6: Définir les instructions pour le LLM
         system_instructions = (
             "Tu es un instructeur expert du dispositif KAP Numérique. Tu réponds à des questions en te basant uniquement sur les informations fournies dans le contexte.\n\n"
             
             "Consignes de réponse :\n"
-            "1. Commence ta réponse en répétant la question posée, par exemple : 'En réponse à votre question : \"[question]\", voici les informations demandées :'\n"
+            "1. Commence ta réponse par, voici les informations demandées :'\n"
             "2. Fournis une réponse concise et structurée.\n"
             "3. Utilise des phrases et des listes à puces pour organiser les informations.\n"
             
@@ -460,24 +416,16 @@ def generate(state: State) -> Dict[str, Any]:
             "8. Cites systématiquement les sources avec le format suivant : [Document: Nom du document, Catégorie: Type de document, Section: Nom de la section, Page: Numéro de page, Mise à jour: Date].\n"
         )
         
-        # Instructions supplémentaires pour un dossier spécifique
-        if state.get("force_dossier_id"):
-            system_instructions += (
-                f"\nATTENTION : Cette question concerne SPÉCIFIQUEMENT le dossier numéro {state['force_dossier_id']}. "
-                f"Concentre-toi UNIQUEMENT sur les informations concernant ce dossier et ignore les informations "
-                f"relatives à d'autres dossiers, même si elles semblent pertinentes."
-            )
-        
-        # Étape 8: Construire l'invite utilisateur
+        # Étape 7: Construire l'invite utilisateur
         user_prompt = f"Question: {state['question']}\n\nContexte extrait des documents et de la base de données:\n{docs_content}"
         
-        # Étape 9: Préparer les messages pour le LLM
+        # Étape 8: Préparer les messages pour le LLM
         messages = [
             {"role": "system", "content": system_instructions},
             {"role": "user", "content": user_prompt}
         ]
         
-        # Étape 10: Appeler le modèle LLM
+        # Étape 9: Appeler le modèle LLM
         try:
             response = llm.invoke(messages)
             return {"answer": response.content}
