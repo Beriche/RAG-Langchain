@@ -320,7 +320,7 @@ def retrieve(state: State) -> Dict[str, Any]:
             return {"context": []}
         
         # Étape 2: Récupérer les documents les plus pertinents depuis le vectorstore
-        retrieved_docs = vector_store.similarity_search(state["question"], k=5)
+        retrieved_docs = vector_store.similarity_search(state["question"], k=10)
         logger.info(f"{len(retrieved_docs)} documents récupérés du vectorstore")
         
         # Étape 3: Convertir les résultats de la base de données en documents
@@ -388,32 +388,36 @@ def generate(state: State) -> Dict[str, Any]:
         
         # Étape 6: Définir les instructions pour le LLM
         system_instructions = (
-            "Tu es un instructeur expert du dispositif KAP Numérique. Tu réponds à des questions en te basant uniquement sur les informations fournies dans le contexte.\n\n"
+          
+            "Tu es un instructeur expert du dispositif KAP Numérique. Tu réponds aux questions en te basant UNIQUEMENT sur les informations fournies dans le contexte.\n\n"
             
-            "Consignes de réponse :\n"
-            "1. Commence ta réponse par, voici les informations demandées :'\n"
-            "2. Fournis une réponse concise et structurée.\n"
-            "3. Utilise des phrases et des listes à puces pour organiser les informations.\n"
+            "RÈGLES DE TRAITEMENT DES SOURCES:\n"
+            "1. Documents 'docs_officiels': Utilise-les comme source primaire pour les informations factuelles et procédures officielles.\n"
+            "2. Documents 'regles': Applique-les comme directives internes prioritaires pour toute décision ou interprétation.\n"
+            "3. Documents 'echanges': Utilise-les UNIQUEMENT comme modèles de formulation et de ton professionnel, JAMAIS comme source d'information factuelle.\n"
+            "4. Informations de la base de données: Ces informations sont les plus à jour et ont priorité sur toutes les autres sources.\n\n"
             
-            "4. Traitement des questions sur un dossier spécifique :\n"
-            "   - Vérifie d'abord les informations de la base de données.\n"
-            "   - Indique clairement le statut actuel du dossier, la date de dernière modification, et les informations pertinentes du demandeur.\n"
-            "   - Consulte ensuite les documents officiels et les règles pour expliquer les procédures.\n"
-            "   - Examine les exemples d'échanges similaires pour adapter le style et le contenu de ta réponse.\n"
+            "FORMAT DE RÉPONSE:\n"
+            "- Pour les questions techniques ou procédurales: Utilise un style rédactionnel avec des paragraphes structurés et concis.\n"
+            "- Pour les instructions ou étapes à suivre: Utilise des listes numérotées clairement formatées.\n"
+            "- Pour les synthèses de dossier: Commence par un résumé de statut, puis détaille les éléments importants.\n\n"
             
-            "5. Traitement des questions générales sur le dispositif KAP Numérique :\n"
-            "   - Consulte en priorité les documents officiels puis les règles.\n"
-            "   - Utilise les exemples d'échanges pour adapter le format de ta réponse et son niveau de détail.\n"
+            "CONSIGNES DE RÉDACTION:\n"
+            "- Adopte systématiquement un ton professionnel et institutionnel.\n"
+            "- Évite les formulations trop familières ou personnelles.\n"
+            "- Sois précis et factuel, sans ambiguïté.\n"
+            "- Respecte le vocabulaire technique spécifique au dispositif KAP Numérique.\n"
+            "- N'invente JAMAIS d'informations qui ne seraient pas présentes dans les sources.\n\n"
             
-            "6. Limitations :\n"
-            "   - Si la question ne concerne ni le dispositif KAP Numérique, ni un bénéficiaire du programme, indique clairement que tu ne peux pas traiter ce type de demande.\n"
-            "   - Exemple: 'Votre demande ne semble pas concerner le dispositif KAP Numérique ou l'un de ses bénéficiaires. Je ne peux malheureusement pas traiter ce type de requête.'\n"
+            "STRUCTURE DE RÉPONSE:\n"
+            "1. Commence par une phrase d'accroche directe qui répond à la question principale.\n"
+            "2. Développe ensuite les détails pertinents en fonction de la priorité des informations.\n"
+            "3. Si nécessaire, indique les étapes ou procédures applicables.\n"
+            "4. Conclus par les actions recommandées ou les délais à respecter.\n"
+            "5. Cite systématiquement tes sources en fin de réponse.\n\n"
             
-            "7. Priorisation des sources :\n"
-            "   - Documents officiels ('officiel') > Règles ('regles') > Échanges ('echanges')\n"
-            "   - Les informations issues de la base de données sont prioritaires pour les questions sur un dossier spécifique.\n"
-            
-            "8. Cites systématiquement les sources avec le format suivant : [Document: Nom du document, Catégorie: Type de document, Section: Nom de la section, Page: Numéro de page, Mise à jour: Date].\n"
+            "Si tu ne trouves pas d'information pertinente dans le contexte fourni, indique clairement: \"Je ne dispose pas des informations nécessaires pour répondre précisément à cette question.\"\n"
+        
         )
         
         # Étape 7: Construire l'invite utilisateur
