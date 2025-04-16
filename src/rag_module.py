@@ -3,6 +3,7 @@ import re
 import hashlib
 import mysql.connector  
 import logging
+from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
@@ -77,35 +78,103 @@ class DatabaseManager:
             logger.error(f"Échec de la connexion : {erreur}")
             return False
     
-    def rechercher_dossier(self, numero_dossier: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
-        """Recherche un dossier dans la base de données."""
+    
+    def rechercher_dossier(self,
+                        search_term: Optional[str] = None,
+                        statut: Optional[str] = None,
+                        instructeur: Optional[str] = None,
+                        date_debut_creation: Optional[date] = None,
+                        date_fin_creation: Optional[date] = None) -> List[Dict[str, Any]]:
+        """
+        Recherche des dossiers dans la base de données avec filtres et recherche floue.
+
+        Args:
+            search_term: Terme pour recherche floue sur Numero ou nom_usager (LIKE %term%).
+                        Peut aussi être un numéro exact.
+            statut: Filtre sur le statut exact.
+            instructeur: Filtre sur l'instructeur exact.
+            date_debut_creation: Date de début pour le filtre sur date_creation.
+            date_fin_creation: Date de fin pour le filtre sur date_creation.
+
+        Returns:
+            Liste des dossiers correspondants.
+        """
         try:
             conn = mysql.connector.connect(**self.config)
-            cursor = conn.cursor(dictionary=True)  # Pour des résultats sous forme de dictionnaires
-            
-            # Construction de la requête SQL
+            cursor = conn.cursor(dictionary=True)
+
+            # Construction dynamique de la requête SQL
+            base_query = "SELECT * FROM dossiers"
             conditions = []
             parametres = []
 
-            if numero_dossier:
-                conditions.append("Numero = %s")
-                parametres.append(numero_dossier)
+            # 1. Recherche floue (LIKE) ou exacte sur Numero/Nom Usager
+            if search_term:
+                # Essayer de détecter si c'est un numéro de dossier formaté
+                is_exact_numero = re.fullmatch(r'\d{2}-\d{4}', search_term) # Adaptez le regex si besoin
 
-            for cle, valeur in kwargs.items():
-                if valeur is not None:
-                    conditions.append(f"{cle} = %s")
-                    parametres.append(valeur)
+                if is_exact_numero:
+                    # Recherche exacte si le format correspond exactement
+                    conditions.append("Numero = %s")
+                    parametres.append(search_term)
+                else:
+                    # Sinon, recherche floue sur Numero OU nom_usager
+                    conditions.append("(Numero LIKE %s OR nom_usager LIKE %s)")
+                    # Ajout des wildcards pour le LIKE
+                    fuzzy_term = f"%{search_term}%"
+                    parametres.extend([fuzzy_term, fuzzy_term])
 
-            requete = f"SELECT * FROM dossiers WHERE {' AND '.join(conditions) if conditions else '1=1'}"
+            # 2. Filtre par Statut
+            if statut:
+                conditions.append("statut = %s")
+                parametres.append(statut)
+
+            # 3. Filtre par Instructeur
+            if instructeur:
+                conditions.append("instructeur = %s")
+                parametres.append(instructeur)
+
+            # 4. Filtre par Plage de Date de Création
+            if date_debut_creation and date_fin_creation:
+                # S'assurer que debut <= fin (bonne pratique)
+                if date_debut_creation <= date_fin_creation:
+                    conditions.append("date_creation BETWEEN %s AND %s")
+                    parametres.extend([date_debut_creation, date_fin_creation])
+                else:
+                    logger.warning("Date de début postérieure à la date de fin dans le filtre.")
+                    # Optionnel : ignorer le filtre de date ou retourner une erreur/liste vide
+            elif date_debut_creation:
+                conditions.append("date_creation >= %s")
+                parametres.append(date_debut_creation)
+            elif date_fin_creation:
+                conditions.append("date_creation <= %s")
+                parametres.append(date_fin_creation)
+
+            # Assemblage de la requête finale
+            if conditions:
+                requete = f"{base_query} WHERE {' AND '.join(conditions)}"
+            else:
+                # Si aucun filtre ni terme de recherche, on pourrait vouloir tout retourner
+                # ou retourner une liste vide pour éviter de charger toute la table.
+                # Pour l'instant, retournons tout (ou limitez avec LIMIT si la table est grande).
+                requete = base_query
+                # requete = f"{base_query} LIMIT 100" # Exemple de limitation
+
+            logger.info(f"Exécution de la requête: {requete} avec params: {parametres}")
             cursor.execute(requete, parametres)
             resultats = cursor.fetchall()
-            
+
             cursor.close()
             conn.close()
+            logger.info(f"{len(resultats)} dossiers trouvés pour les critères.")
             return resultats
         except mysql.connector.Error as erreur:
-            logger.error(f"Erreur de recherche : {erreur}")
+            logger.error(f"Erreur de recherche de dossier: {erreur}")
             return []
+        except Exception as e:
+            logger.error(f"Erreur inattendue dans rechercher_dossier: {e}", exc_info=True)
+            return []
+    
 
 # ================= GESTION DES DOCUMENTS ET EMBEDDINGS =================
 

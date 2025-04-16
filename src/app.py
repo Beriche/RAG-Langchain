@@ -1,14 +1,37 @@
 import streamlit as st
 import os
 import time
+import rag_module
 import pandas as pd
-from typing import Dict, Any, List, Optional
 import logging
 import json
+from datetime import date, timedelta # Importer date 
+from typing import Dict, Any, List, Optional
+
+
 
 # --- Configuration du Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("streamlit_app")
+
+# --- Configuration de la Page Streamlit ---
+st.set_page_config(
+    page_title="Assistant KAP Numérique",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'mailto:support@kap-numerique.fr',
+        'Report a bug': "mailto:support@kap-numerique.fr",
+        'About': """
+        **Assistant KAP Numérique Beta v1.0**
+
+        Cet assistant utilise un système RAG (Retrieval Augmented Generation)
+        pour répondre aux questions des instructeurs du dispositif KAP Numérique.
+        Il peut fournir des informations générales ou spécifiques à un dossier.
+        """
+    }
+)
 
 # --- Variables d'état (Session State) ---
 def init_session_state():
@@ -34,42 +57,43 @@ def init_session_state():
 # Initialiser l'état de session au démarrage
 init_session_state()
 
-# --- Importation du Module RAG (Version Réelle) ---
+# --- Importation et Initialisation du Module RAG ---
 try:
-    import rag_module 
     rag_import_success = True
     logger.info("Module RAG importé avec succès.")
+
+    # --- Initialisation Automatique ---
+    # On Vérifie si le système est déjà initialisé dans cette session
+    if not st.session_state.initialized:
+        initialization_placeholder = st.empty() # Créer un espace pour le message/spinner
+        with initialization_placeholder.container():
+            with st.spinner("⏳ Initialisation de l'assistant en cours, veuillez patienter..."):
+                try:
+                    start_time = time.time()
+                    # Appel de la fonction d'initialisation
+                    st.session_state.rag_components = rag_module.init_rag_system()
+                    st.session_state.initialized = True
+                    st.session_state.system_status_msg = "✅ Système prêt et connecté."
+                    st.session_state.error_message = None
+                    duration = time.time() - start_time
+                    #logger.info(f"Système RAG initialisé avec succès en {duration:.2f} secondes.")
+                    # Optionnel: Afficher un message de succès temporaire
+                    st.success(f"Assistant initialisé en {duration:.2f}s !")
+                    time.sleep(2) # Garder le message de succès visible un instant
+                except Exception as e:
+                    logger.error(f"Erreur critique lors de l'initialisation du RAG: {e}", exc_info=True)
+                    st.session_state.initialized = False
+                    st.session_state.error_message = f"❌ Erreur d'initialisation: {e}. L'assistant risque de ne pas fonctionner."
+                    st.session_state.system_status_msg = "❌ Erreur d'initialisation."
+                    # Afficher l'erreur persistante si l'initialisation échoue
+                    st.error(st.session_state.error_message)
+
+        # Nettoyer le placeholder une fois l'initialisation terminée (succès ou échec géré)
+        initialization_placeholder.empty()
 except ImportError as e:
-    rag_import_success = False
-    error_message = f"Erreur d'importation du module RAG: {e}. Les fonctionnalités RAG ne seront pas disponibles."
-    logger.error(error_message)
-
-    st.session_state.error_message = error_message
+    st.session_state.initialized = False # Marquer comme non initialisé si l'import échoue
+    st.session_state.system_status_msg = "❌ Module RAG introuvable."
     
-    st.error(error_message)
-
-
-# --- Configuration de la Page Streamlit ---
-st.set_page_config(
-    page_title="Assistant KAP Numérique",
-    page_icon="🤖",  # Using an emoji as icon
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'mailto:support@kap-numerique.fr',
-        'Report a bug': "mailto:support@kap-numerique.fr",
-        'About': """
-        **Assistant KAP Numérique v1.0**
-
-        Cet assistant utilise un système RAG (Retrieval Augmented Generation)
-        pour répondre aux questions des instructeurs du dispositif KAP Numérique.
-        Il peut fournir des informations générales ou spécifiques à un dossier.
-
-        *Créé par Chahalane Bériche*
-        """
-    }
-)
-
 # --- Styles CSS Personnalisés ---
 st.markdown("""
 <style>
@@ -292,6 +316,265 @@ def initialize_rag_system() -> bool:
         except Exception:
             pass
 
+def get_dossier_data_for_timeline(numero_dossier: str) -> Optional[Dict]:
+    """
+    Récupère les données d'un dossier spécifique pour la timeline.
+    Utilise les résultats déjà chargés si possible, sinon refait une recherche.
+    """
+    # 1. Essayer de trouver dans les résultats déjà affichés
+    if 'dossier_search_results' in st.session_state and st.session_state.dossier_search_results:
+        for dossier in st.session_state.dossier_search_results:
+            if dossier.get('Numero') == numero_dossier:
+                return dossier
+
+    # 2. Si non trouvé (ou si on veut être sûr d'avoir les dernières infos), refaire une recherche exacte
+    logger.info(f"Données non trouvées dans le cache local pour {numero_dossier}, recherche en base...")
+    search_function = st.session_state.rag_components.get("rechercher_dossier")
+    if callable(search_function):
+        try:
+            # Recherche exacte par Numero
+            results = search_function(search_term=numero_dossier)
+            if results:
+                return results[0] # Retourne le premier (et normalement unique) résultat
+            else:
+                logger.warning(f"Impossible de retrouver le dossier {numero_dossier} pour la timeline.")
+                return None
+        except Exception as e:
+            logger.error(f"Erreur en rechargeant le dossier {numero_dossier}: {e}")
+            return None
+    return None
+
+
+def display_dossier_timeline(numero_dossier: str):
+    """Affiche une timeline simplifiée pour un dossier."""
+    st.markdown(f"#### Historique Simplifié du Dossier {numero_dossier}")
+
+    dossier_data = get_dossier_data_for_timeline(numero_dossier)
+
+    if not dossier_data:
+        st.warning("Impossible de charger les données du dossier pour afficher l'historique.")
+        return
+
+    # Création des événements de la timeline (version simplifiée)
+    events = []
+
+    # 1. Création
+    date_creation = dossier_data.get('date_creation')
+    if date_creation:
+         # Formater la date pour l'affichage
+         try:
+            date_str = date_creation.strftime('%d %B %Y') if isinstance(date_creation, date) else str(date_creation)
+            events.append({
+                "date": date_str,
+                "event": "📅 Création du dossier",
+                "details": f"Dossier initié pour {dossier_data.get('nom_usager', 'N/A')}."
+            })
+         except AttributeError: # Au cas où ce n'est ni une date ni une string formatable
+             events.append({"date": str(date_creation), "event": "📅 Création du dossier", "details": "Date de création enregistrée."})
+
+
+    # 2. Dernière Modification (si différente de la création et non nulle)
+    date_modif = dossier_data.get('derniere_modification')
+    if date_modif and date_modif != date_creation : # Vérifier si la date est différente
+         try:
+            # Essayer de formater date ET heure si possible
+            if hasattr(date_modif, 'strftime'):
+                 date_str = date_modif.strftime('%d %B %Y à %H:%M')
+            else:
+                 date_str = str(date_modif)
+
+            events.append({
+                "date": date_str,
+                "event": "✍️ Dernière Modification",
+                "details": f"Le dossier a été mis à jour. Statut actuel : {dossier_data.get('statut', 'N/A')}."
+                         f" (Instructeur: {dossier_data.get('instructeur', 'N/A')})"
+            })
+         except Exception as e: # Gestion d'erreur générique pour le formatage
+              logger.error(f"Erreur formatage date modif {date_modif}: {e}")
+              events.append({"date": str(date_modif), "event": "✍️ Dernière Modification", "details": f"Statut: {dossier_data.get('statut', 'N/A')}"})
+
+    # --- Option 1: Affichage simple avec st.markdown ---
+    if events:
+        st.markdown("**Événements Clés :**")
+        # Trier par date (même si ici c'est simple, bonne pratique pour une vraie timeline)
+        # On suppose que les dates sont comparables. Si ce sont des strings, le tri peut être incorrect.
+        # Pour un tri robuste, il faudrait convertir en objets date/datetime.
+        # events.sort(key=lambda x: datetime.strptime(x['date'], '...format...') if isinstance(x['date'], str) else x['date']) # Exemple complexe
+
+        for event in events:
+            st.markdown(f"- **{event['date']} :** {event['event']}")
+            st.caption(f"  > {event['details']}")
+    else:
+        st.info("Aucun événement historique majeur à afficher pour ce dossier (basé sur les données disponibles).")
+
+
+
+def display_dossier_details_enhanced(dossier: Dict, index: int):
+    """Affiche les détails d'un dossier de manière plus structurée et visuelle."""
+    numero_dossier = dossier.get('Numero', f'Inconnu_{index}')
+    container_key = f"dossier_container_{numero_dossier}_{index}" # Clé unique pour le conteneur
+
+    with st.container(border=True): # Utiliser une bordure pour séparer visuellement
+        st.subheader(f"📁 Dossier : {dossier.get('Numero', 'N/A')}")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            # Utiliser st.metric pour les infos clés
+            st.metric(label="Statut", value=dossier.get('statut', 'N/A'))
+        with col2:
+            # Formatter le montant en euros
+            montant = dossier.get('montant', 0)
+            try:
+                 montant_formate = f"{float(montant):,.2f} €".replace(",", " ").replace(".", ",") if montant else "N/A"
+            except (ValueError, TypeError):
+                 montant_formate = "N/A"
+            st.metric(label="Montant Demandé", value=montant_formate)
+        with col3:
+             # Utiliser st.metric pour la date importante
+             date_crea = dossier.get('date_creation', 'N/A')
+             # Essayer de formater la date si elle existe
+             try:
+                 if isinstance(date_crea, date):
+                      date_crea_formatee = date_crea.strftime('%d/%m/%Y')
+                 elif isinstance(date_crea, str): # Si c'est une chaîne, on essaie de la garder
+                      date_crea_formatee = date_crea
+                 else:
+                      date_crea_formatee = "N/A"
+             except Exception:
+                  date_crea_formatee = "N/A"
+
+             st.metric(label="Date Création", value=date_crea_formatee)
+
+
+        st.markdown("**Informations Usager**")
+        st.text(f"Nom: {dossier.get('nom_usager', 'N/A')}")
+        # Ajoutez d'autres infos usager si disponibles
+
+        st.markdown("**Assignations et Suivi**")
+        assign_col1, assign_col2, assign_col3 = st.columns(3)
+        with assign_col1:
+            st.text(f"Agent Affecté: {dossier.get('agent_affecter', 'N/A')}")
+        with assign_col2:
+            st.text(f"Instructeur: {dossier.get('instructeur', 'N/A')}")
+        with assign_col3:
+             st.text(f"Valideur: {dossier.get('valideur', 'N/A')}")
+
+
+        # Afficher les dates importantes restantes
+        date_modif = dossier.get('derniere_modification', 'N/A')
+        try:
+             if isinstance(date_modif, date):
+                  date_modif_formatee = date_modif.strftime('%d/%m/%Y %H:%M') # Ajouter l'heure si disponible
+             elif isinstance(date_modif, str):
+                  date_modif_formatee = date_modif
+             else:
+                 date_modif_formatee = "N/A"
+        except Exception:
+             date_modif_formatee = "N/A"
+        st.caption(f"Dernière modification : {date_modif_formatee}")
+
+
+        # --- Expander pour les détails complets (Tableau comme avant) ---
+        with st.expander("Voir tous les champs bruts"):
+            try:
+                # Filtrer pour éviter les objets non sérialisables si besoin
+                displayable_dossier = {k: v for k, v in dossier.items() if isinstance(v, (str, int, float, bool, date))} # Adapter les types si nécessaire
+                df_dossier = pd.DataFrame.from_dict(displayable_dossier, orient='index', columns=['Valeur'])
+                df_dossier.index.name = "Champ"
+                st.dataframe(df_dossier, use_container_width=True)
+            except Exception as e:
+                logger.error(f"Erreur lors de la création du DataFrame pour les détails du dossier {numero_dossier}: {e}")
+                st.warning("Impossible d'afficher les détails bruts sous forme de tableau.")
+                # st.json(dossier) # Fallback en JSON
+
+        # --- Bouton pour la Timeline (Étape 5) ---
+        if st.button(f"🕒 Voir l'historique du dossier {numero_dossier}", key=f"timeline_btn_{numero_dossier}_{index}"):
+            display_dossier_timeline(numero_dossier) # Fonction à créer à l'étape 5
+
+        st.markdown("---") # Séparateur léger entre les dossiers
+def display_dossier_details_enhanced(dossier: Dict, index: int):
+    """Affiche les détails d'un dossier de manière plus structurée et visuelle."""
+    numero_dossier = dossier.get('Numero', f'Inconnu_{index}')
+    container_key = f"dossier_container_{numero_dossier}_{index}" # Clé unique pour le conteneur
+
+    with st.container(border=True): # Utiliser une bordure pour séparer visuellement
+        st.subheader(f"📁 Dossier : {dossier.get('Numero', 'N/A')}")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            # Utiliser st.metric pour les infos clés
+            st.metric(label="Statut", value=dossier.get('statut', 'N/A'))
+        with col2:
+            # Formatter le montant en euros
+            montant = dossier.get('montant', 0)
+            try:
+                 montant_formate = f"{float(montant):,.2f} €".replace(",", " ").replace(".", ",") if montant else "N/A"
+            except (ValueError, TypeError):
+                 montant_formate = "N/A"
+            st.metric(label="Montant Demandé", value=montant_formate)
+        with col3:
+             # Utiliser st.metric pour la date importante
+             date_crea = dossier.get('date_creation', 'N/A')
+             # Essayer de formater la date si elle existe
+             try:
+                 if isinstance(date_crea, date):
+                      date_crea_formatee = date_crea.strftime('%d/%m/%Y')
+                 elif isinstance(date_crea, str): # Si c'est une chaîne, on essaie de la garder
+                      date_crea_formatee = date_crea
+                 else:
+                      date_crea_formatee = "N/A"
+             except Exception:
+                  date_crea_formatee = "N/A"
+
+             st.metric(label="Date Création", value=date_crea_formatee)
+
+
+        st.markdown("**Informations Usager**")
+        st.text(f"Nom: {dossier.get('nom_usager', 'N/A')}")
+        # Ajoutez d'autres infos usager si disponibles
+
+        st.markdown("**Assignations et Suivi**")
+        assign_col1, assign_col2, assign_col3 = st.columns(3)
+        with assign_col1:
+            st.text(f"Agent Affecté: {dossier.get('agent_affecter', 'N/A')}")
+        with assign_col2:
+            st.text(f"Instructeur: {dossier.get('instructeur', 'N/A')}")
+        with assign_col3:
+             st.text(f"Valideur: {dossier.get('valideur', 'N/A')}")
+
+
+        # Afficher les dates importantes restantes
+        date_modif = dossier.get('derniere_modification', 'N/A')
+        try:
+             if isinstance(date_modif, date):
+                  date_modif_formatee = date_modif.strftime('%d/%m/%Y %H:%M') # Ajouter l'heure si disponible
+             elif isinstance(date_modif, str):
+                  date_modif_formatee = date_modif
+             else:
+                 date_modif_formatee = "N/A"
+        except Exception:
+             date_modif_formatee = "N/A"
+        st.caption(f"Dernière modification : {date_modif_formatee}")
+
+
+        # --- Expander pour les détails complets (Tableau comme avant) ---
+        with st.expander("Voir tous les champs bruts"):
+            try:
+                # Filtrer pour éviter les objets non sérialisables si besoin
+                displayable_dossier = {k: v for k, v in dossier.items() if isinstance(v, (str, int, float, bool, date))} # Adapter les types si nécessaire
+                df_dossier = pd.DataFrame.from_dict(displayable_dossier, orient='index', columns=['Valeur'])
+                df_dossier.index.name = "Champ"
+                st.dataframe(df_dossier, use_container_width=True)
+            except Exception as e:
+                logger.error(f"Erreur lors de la création du DataFrame pour les détails du dossier {numero_dossier}: {e}")
+                st.warning("Impossible d'afficher les détails bruts sous forme de tableau.")
+                # st.json(dossier) # Fallback en JSON
+
+        # --- Bouton pour la Timeline (Étape 5) ---
+        if st.button(f"🕒 Voir l'historique du dossier {numero_dossier}", key=f"timeline_btn_{numero_dossier}_{index}"):
+            display_dossier_timeline(numero_dossier) # Fonction à créer à l'étape 5
+
+        st.markdown("---") # Séparateur léger entre les dossiers
 
 def save_chat_history():
     """Sauvegarde l'historique de conversation dans un fichier JSON."""
@@ -511,92 +794,31 @@ def display_dossier_details(dossier: Dict):
 
 # ===== INTERFACE PRINCIPALE =====
 
+# Vérifier si l'initialisation a échoué et bloquer si nécessaire
+if not st.session_state.initialized and rag_import_success:
+     st.error("L'initialisation de l'assistant a échoué. Veuillez vérifier les logs ou contacter le support.")
+     st.stop() # Arrêter l'exécution si l'initialisation est critique et a échoué
+elif not rag_import_success:
+     st.error("Le module RAG n'a pas pu être chargé. L'application ne peut pas démarrer.")
+     st.stop()
+
+
 # --- Barre Latérale  ---
 with st.sidebar:
     st.image("logo_region_reunion.png", width=150) #  Logo
     st.header("⚙️ Contrôle Système")
+    
+with st.sidebar:
+    st.title("Assistant KAP Numérique")
+    # Afficher le statut du système
+    status_color = "red"
+    if st.session_state.initialized:
+        status_color = "green"
+    elif "Initialisation" in st.session_state.system_status_msg:
+         status_color = "orange"
+    st.markdown(f"**Statut:** <span style='color:{status_color};'>{st.session_state.system_status_msg}</span>", unsafe_allow_html=True)
 
-    # Section Initialisation
-    with st.expander("🚀 Initialisation RAG", expanded=not st.session_state.initialized):
-        if not st.session_state.initialized:
-            
-            if not rag_import_success:
-                 st.error("Échec de l'import du module RAG. Vérifiez la configuration et les logs.")
-            else:
-                 st.warning("Le système RAG doit être initialisé.")
-                 if st.button("🔵 Initialiser le Système RAG", use_container_width=True, key="init_button"):
-                     with st.spinner("Initialisation en cours..."):
-                          initialize_rag_system()
-                          st.rerun() 
-        else:
-            st.success("✅ Système RAG Opérationnel")
-            if st.button("🔄 Réinitialiser", use_container_width=True, key="reinit_button"):
-                 # Reset relevant state variables
-                 st.session_state.initialized = False
-                 st.session_state.rag_components = None
-                 st.session_state.active_dossier = None
-                 st.session_state.chat_history = []
-                 st.session_state.last_result = None
-                 st.session_state.system_status_msg = "Système non initialisé."
-                 logger.info("Système RAG réinitialisé par l'utilisateur.")
-                 st.warning("Système marqué pour réinitialisation. Cliquez sur 'Initialiser'.")
-                 st.rerun()
-
-
-        # Afficher le message d'état
-        status_class = "system-offline"
-        if "Initialisation en cours" in st.session_state.system_status_msg:
-             status_class = "system-initializing"
-        elif st.session_state.initialized:
-             status_class = "system-online"
-        elif "Échec" in st.session_state.system_status_msg: 
-             status_class = "system-offline"
-
-        st.markdown(f'<div class="system-status-badge {status_class}">{st.session_state.system_status_msg}</div>', unsafe_allow_html=True)
-
-
-    # Section État du Système 
-    if st.session_state.initialized and st.session_state.rag_components and isinstance(st.session_state.rag_components, dict):
-        with st.expander("📊 État du Système", expanded=False):
-            components = st.session_state.rag_components
-         
-            db_connected = components.get("db_connected", None) 
-            if db_connected is True:
-                st.markdown("✔️ <span style='color:green;'>Connecté à la base de données</span>", unsafe_allow_html=True)
-            elif db_connected is False:
-                st.markdown("⚠️ <span style='color:orange;'>Base de données non connectée</span>", unsafe_allow_html=True)
-          
-            docs = components.get("docs", []) 
-            if isinstance(docs, list):
-                 st.info(f"📄 {len(docs)} documents chargés (selon init_rag_system).")
-
-                 doc_categories = {}
-                 for doc in docs:
-                     
-                    if isinstance(doc, dict):
-                         meta = doc.get("metadata", {})
-                         if isinstance(meta, dict):
-                              category = meta.get("category", "Non classifié")
-                              doc_categories[category] = doc_categories.get(category, 0) + 1
-
-                 if doc_categories:
-                    st.markdown("##### Répartition des Documents (Exemple)")
-                    try:
-                         chart_data = pd.DataFrame({
-                            'Catégorie': list(doc_categories.keys()),
-                            'Nombre': list(doc_categories.values())
-                         })
-                         st.bar_chart(chart_data.set_index('Catégorie'), use_container_width=True)
-                    except Exception as chart_e:
-                         logger.warning(f"Could not generate document category chart: {chart_e}")
-
-            perf = components.get("performance", {}) 
-            if isinstance(perf, dict):
-                 avg_time = perf.get('avg_response_time', None)
-                 if avg_time is not None:
-                      st.metric(label="Temps de réponse moyen (simulé)", value=f"{avg_time:.2f} s")
-
-
+    
     # Section Options d'Affichage
     with st.expander("👁️ Options d'Affichage", expanded=True):
         st.session_state.show_sources = st.toggle("Afficher les sources citées", value=st.session_state.show_sources, key="toggle_sources")
@@ -736,68 +958,144 @@ with tab_general:
 
         
 # --- Onglet Consultation de Dossier ---
+# --- Onglet Consultation de Dossier ---
 with tab_dossier:
     st.header("Rechercher et consulter un dossier spécifique")
-    st.markdown("Entrez un numéro de dossier pour le rechercher.")
+    st.markdown("Utilisez les filtres et/ou la barre de recherche pour trouver des dossiers.")
 
-    # Zone de recherche de dossier
+    # --- Section des Filtres ---
+    with st.expander("🔍 Afficher les Filtres", expanded=False): # Commence fermé
+        # Récupérer les composants RAG pour accéder aux fonctions DB
+        rag_components = st.session_state.get('rag_components', {})
+        get_distinct_values_func = rag_components.get('get_distinct_values')
+
+        col_filter1, col_filter2 = st.columns(2)
+
+        with col_filter1:
+            # Filtre Statut
+            statuts_options = ["Tous"] # Option par défaut
+            if get_distinct_values_func:
+                try:
+                    distinct_statuts = get_distinct_values_func('statut')
+                    statuts_options.extend(distinct_statuts)
+                except Exception as e:
+                    logger.warning(f"Impossible de charger les statuts distincts: {e}")
+                    st.warning("Impossible de charger la liste des statuts.")
+            # Utiliser st.session_state pour garder la valeur sélectionnée
+            st.session_state.filter_statut = st.selectbox(
+                "Filtrer par Statut",
+                options=statuts_options,
+                index=0, # "Tous" par défaut
+                key="filter_statut_selectbox" # Clé unique
+            )
+
+            # Filtre Date de Création (Début)
+            st.session_state.filter_date_debut = st.date_input(
+                "Dossiers créés après le",
+                value=None, # Pas de date par défaut
+                key="filter_date_debut_input"
+            )
+
+        with col_filter2:
+            # Filtre Instructeur
+            instructeurs_options = ["Tous"]
+            if get_distinct_values_func:
+                try:
+                    distinct_instructeurs = get_distinct_values_func('instructeur')
+                    instructeurs_options.extend(distinct_instructeurs)
+                except Exception as e:
+                     logger.warning(f"Impossible de charger les instructeurs distincts: {e}")
+                     st.warning("Impossible de charger la liste des instructeurs.")
+            st.session_state.filter_instructeur = st.selectbox(
+                "Filtrer par Instructeur",
+                options=instructeurs_options,
+                index=0, # "Tous" par défaut
+                key="filter_instructeur_selectbox"
+            )
+
+            # Filtre Date de Création (Fin)
+            st.session_state.filter_date_fin = st.date_input(
+                "Dossiers créés avant le",
+                value=None, # date.today() pourrait être une option
+                key="filter_date_fin_input"
+            )
+
+    # --- Zone de Recherche (Texte) ---
     search_col, btn_col = st.columns([4, 1])
     with search_col:
         dossier_search_input = st.text_input(
-            "Numéro de dossier (ex: 82-2069)",
-            key="dossier_search_input",
-            placeholder="Entrez le numéro exact du dossier...",
+            "Rechercher par N° de dossier ou Nom usager...", # Placeholder mis à jour
+            key="dossier_search_input_fuzzy", # Clé potentiellement nouvelle ou mise à jour
+            placeholder="Entrez un numéro exact (XX-YYYY) ou un terme...",
             label_visibility="collapsed"
         )
     with btn_col:
         search_button = st.button(
             "🔎 Rechercher",
-            key="search_dossier_button",
+            key="search_dossier_button_combined", # Clé potentiellement nouvelle ou mise à jour
             use_container_width=True,
-            disabled=not st.session_state.initialized or not dossier_search_input
+            # Désactivé si RAG non prêt OU si l'input ET les filtres sont vides (optionnel)
+            disabled=not st.session_state.initialized
         )
 
-    # Logique de recherche et affichage des résultats
-    if search_button and dossier_search_input:
-        with st.spinner(f"Recherche du dossier '{dossier_search_input}'..."):
-            found_dossiers = search_dossier(dossier_search_input)  # Met à jour st.session_state.dossier_search_results
-            if found_dossiers:  # Vérifier que la liste n'est pas vide et contient des dictionnaires
-                if isinstance(found_dossiers[0], dict):
-                    st.success(f"{len(found_dossiers)} dossier(s) trouvé(s) pour '{dossier_search_input}'.")
-                    # Affichage de la liste des dossiers trouvés
-                    for dossier in found_dossiers:
-                        st.markdown("---")
-                        display_dossier_details(dossier)
-                else:
-                    st.error("Format de données invalide retourné par la recherche.")
-            # La fonction search_dossier gère déjà l'affichage d'un avertissement en cas d'aucun résultat.
+    # --- Logique de Recherche et Affichage ---
+    if search_button: # Se déclenche quand le bouton est cliqué
+        # Récupérer les valeurs des filtres depuis session_state
+        term = dossier_search_input # Le terme de la barre de recherche
+        statut_filter = st.session_state.filter_statut if st.session_state.filter_statut != "Tous" else None
+        instructeur_filter = st.session_state.filter_instructeur if st.session_state.filter_instructeur != "Tous" else None
+        date_debut_filter = st.session_state.filter_date_debut
+        date_fin_filter = st.session_state.filter_date_fin
 
-    # Si aucun dossier n'est recherché, on affiche un message informatif
-    if not search_button:
-        st.info("Recherchez un dossier en entrant son numéro ci-dessus.")
+        # Vérifier si au moins un critère est fourni (optionnel mais évite recherche vide)
+        if not term and not statut_filter and not instructeur_filter and not date_debut_filter and not date_fin_filter:
+             st.warning("Veuillez entrer un terme de recherche ou sélectionner au moins un filtre.")
+             st.session_state.dossier_search_results = [] # Vider les résultats précédents
+        else:
+             # Appel de la fonction de recherche Backend MISE À JOUR
+             search_function = st.session_state.rag_components.get("rechercher_dossier")
+             if callable(search_function):
+                  with st.spinner(f"Recherche des dossiers..."):
+                     try:
+                        # Passer les arguments nommés mis à jour
+                        found_dossiers = search_function(
+                            search_term=term if term else None,
+                            statut=statut_filter,
+                            instructeur=instructeur_filter,
+                            date_debut_creation=date_debut_filter,
+                            date_fin_creation=date_fin_filter
+                        )
+                        st.session_state.dossier_search_results = found_dossiers # Stocker les résultats
+                        if found_dossiers:
+                            st.success(f"{len(found_dossiers)} dossier(s) trouvé(s).")
+                        else:
+                            st.info("Aucun dossier ne correspond à vos critères de recherche.")
+                     except Exception as e:
+                         logger.error(f"Erreur lors de l'appel à rechercher_dossier depuis Streamlit: {e}", exc_info=True)
+                         st.error(f"Une erreur est survenue pendant la recherche: {e}")
+                         st.session_state.dossier_search_results = None
+             else:
+                  st.error("La fonction de recherche de dossier n'est pas disponible.")
+                  st.session_state.dossier_search_results = None
 
-# --- Traitement Centralisé des Questions (après rerun) ---
-# Ce bloc s'exécute après un éventuel déclenchement par l'envoi d'une question
-if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user" and not st.session_state.is_processing:
-    last_query = st.session_state.chat_history[-1]["content"]
-
-    spinner_msg = "🧠 Traitement de la question..."
-    with st.spinner(spinner_msg):
-        response = process_user_query(last_query)  # La fonction process_user_query n'utilise plus de dossier actif
-    st.session_state.chat_history.append({"role": "assistant", "content": response})
-    st.rerun()  # Rerun pour afficher la réponse
-
-# Zone de saisie du chat général (utilisée également pour des questions concernant un dossier, sans que celui-ci devienne actif)
-prompt = st.chat_input(
-    "Posez votre question...",
-    key="chat_input",
-    disabled=not st.session_state.initialized or st.session_state.is_processing
-)
-if prompt:
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    st.rerun()
-
-
+    # --- Affichage Amélioré des Résultats (toujours visible si des résultats existent en session_state) ---
+    if 'dossier_search_results' in st.session_state and st.session_state.dossier_search_results is not None:
+         results_to_display = st.session_state.dossier_search_results
+         if not results_to_display:
+             # Afficher le message "Aucun dossier..." seulement si une recherche a été effectuée (bouton cliqué)
+             if search_button: # Ou une autre variable pour savoir si une recherche a été tentée
+                  st.info("Aucun dossier ne correspond à vos critères de recherche.")
+             # else: # Si aucune recherche n'a encore été faite, ne rien afficher ou un message par défaut
+             #    st.info("Utilisez les filtres ou la barre de recherche ci-dessus.")
+         else:
+             st.markdown(f"--- \n### {len(results_to_display)} Dossier(s) Trouvé(s)")
+             for index, dossier in enumerate(results_to_display):
+                 if isinstance(dossier, dict):
+                     # Utiliser la fonction d'affichage améliorée (Étape 4)
+                     display_dossier_details_enhanced(dossier, index) # Nouvelle fonction à créer
+                 else:
+                     st.warning(f"Format de résultat de dossier inattendu à l'index {index}: {type(dossier)}")
+                     st.json(dossier) # Afficher le JSON brut en cas de problème
 
 # --- Footer ---
 st.markdown("""
