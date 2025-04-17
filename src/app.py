@@ -473,25 +473,12 @@ def display_dossier_details_enhanced(dossier: Dict, index: int):
              date_modif_formatee = "N/A"
         st.caption(f"Dernière modification : {date_modif_formatee}")
 
-
-        # --- Expander pour les détails complets (Tableau comme avant) ---
-        with st.expander("Voir tous les champs bruts"):
-            try:
-                # Filtrer pour éviter les objets non sérialisables si besoin
-                displayable_dossier = {k: v for k, v in dossier.items() if isinstance(v, (str, int, float, bool, date))} # Adapter les types si nécessaire
-                df_dossier = pd.DataFrame.from_dict(displayable_dossier, orient='index', columns=['Valeur'])
-                df_dossier.index.name = "Champ"
-                st.dataframe(df_dossier, use_container_width=True)
-            except Exception as e:
-                logger.error(f"Erreur lors de la création du DataFrame pour les détails du dossier {numero_dossier}: {e}")
-                st.warning("Impossible d'afficher les détails bruts sous forme de tableau.")
-                # st.json(dossier) # Fallback en JSON
-
         # --- Bouton pour la Timeline (Étape 5) ---
         if st.button(f"🕒 Voir l'historique du dossier {numero_dossier}", key=f"timeline_btn_{numero_dossier}_{index}"):
             display_dossier_timeline(numero_dossier) # Fonction à créer à l'étape 5
 
         st.markdown("---") # Séparateur léger entre les dossiers
+        
 def display_dossier_details_enhanced(dossier: Dict, index: int):
     """Affiche les détails d'un dossier de manière plus structurée et visuelle."""
     numero_dossier = dossier.get('Numero', f'Inconnu_{index}')
@@ -555,20 +542,6 @@ def display_dossier_details_enhanced(dossier: Dict, index: int):
         except Exception:
              date_modif_formatee = "N/A"
         st.caption(f"Dernière modification : {date_modif_formatee}")
-
-
-        # --- Expander pour les détails complets (Tableau comme avant) ---
-        with st.expander("Voir tous les champs bruts"):
-            try:
-                # Filtrer pour éviter les objets non sérialisables si besoin
-                displayable_dossier = {k: v for k, v in dossier.items() if isinstance(v, (str, int, float, bool, date))} # Adapter les types si nécessaire
-                df_dossier = pd.DataFrame.from_dict(displayable_dossier, orient='index', columns=['Valeur'])
-                df_dossier.index.name = "Champ"
-                st.dataframe(df_dossier, use_container_width=True)
-            except Exception as e:
-                logger.error(f"Erreur lors de la création du DataFrame pour les détails du dossier {numero_dossier}: {e}")
-                st.warning("Impossible d'afficher les détails bruts sous forme de tableau.")
-                # st.json(dossier) # Fallback en JSON
 
         # --- Bouton pour la Timeline (Étape 5) ---
         if st.button(f"🕒 Voir l'historique du dossier {numero_dossier}", key=f"timeline_btn_{numero_dossier}_{index}"):
@@ -1096,6 +1069,28 @@ with tab_dossier:
                  else:
                      st.warning(f"Format de résultat de dossier inattendu à l'index {index}: {type(dossier)}")
                      st.json(dossier) # Afficher le JSON brut en cas de problème
+
+
+# --- Traitement Centralisé des Questions (après rerun) ---
+# Ce bloc s'exécute après un éventuel déclenchement par l'envoi d'une question
+if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user" and not st.session_state.is_processing:
+    last_query = st.session_state.chat_history[-1]["content"]
+
+    spinner_msg = "🧠 Traitement de la question..."
+    with st.spinner(spinner_msg):
+        response = process_user_query(last_query)  # La fonction process_user_query n'utilise plus de dossier actif
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
+    st.rerun()  # Rerun pour afficher la réponse
+
+# Zone de saisie du chat général (utilisée également pour des questions concernant un dossier, sans que celui-ci devienne actif)
+prompt = st.chat_input(
+    "Posez votre question...",
+    key="chat_input",
+    disabled=not st.session_state.initialized or st.session_state.is_processing
+)
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    st.rerun()
 
 # --- Footer ---
 st.markdown("""
