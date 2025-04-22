@@ -3,10 +3,12 @@ import re
 import hashlib
 import mysql.connector  
 import logging
+from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_mistralai import MistralAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain.document_loaders import DirectoryLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -14,6 +16,7 @@ from langchain.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langgraph.graph import StateGraph, END, START
+from openai import OpenAI
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -21,6 +24,8 @@ logger = logging.getLogger("rag_module")
 
 # Chargement des variables d'environnement
 load_dotenv()
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Chemins vers les répertoires de données
 DATA_ROOT = os.getenv("DATA_ROOT", "../data")
@@ -77,35 +82,126 @@ class DatabaseManager:
             logger.error(f"Échec de la connexion : {erreur}")
             return False
     
-    def rechercher_dossier(self, numero_dossier: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]:
-        """Recherche un dossier dans la base de données."""
+    
+    def rechercher_dossier(self,
+                      search_term: Optional[str] = None,
+                      numero_dossier: Optional[str] = None,  # Pour la rétrocompatibilité
+                      statut: Optional[str] = None,
+                      instructeur: Optional[str] = None,
+                      date_debut_creation: Optional[date] = None,
+                      date_fin_creation: Optional[date] = None,
+                      limit: Optional[int] = 50,
+                      **kwargs) -> List[Dict[str, Any]]:
+        """
+        Recherche des dossiers dans la base de données avec priorité au numéro exact.
+        
+        Args:
+            search_term: Terme pour recherche (floue ou exacte selon le format).
+            numero_dossier: Recherche exacte par numéro (prioritaire sur search_term).
+            statut: Filtre sur le statut.
+            instructeur: Filtre sur l'instructeur.
+            date_debut_creation: Date de début pour filtrer sur date_creation.
+            date_fin_creation: Date de fin pour filtrer sur date_creation.
+            limit: Nombre maximum de résultats à retourner.
+            **kwargs: Critères supplémentaires pour rétrocompatibilité.
+            
+        Returns:
+            Liste des dossiers correspondants aux critères.
+        """
         try:
             conn = mysql.connector.connect(**self.config)
-            cursor = conn.cursor(dictionary=True)  # Pour des résultats sous forme de dictionnaires
+            cursor = conn.cursor(dictionary=True)
             
             # Construction de la requête SQL
+            base_query = "SELECT * FROM dossiers"
             conditions = []
             parametres = []
-
+            
+            # *** PRIORITÉ À LA RECHERCHE PAR NUMÉRO EXACT ***
+            # Si numero_dossier est fourni, c'est la priorité absolue
             if numero_dossier:
                 conditions.append("Numero = %s")
-                parametres.append(numero_dossier)
-
+                parametres.append(numero_dossier.strip())
+            # Sinon, on regarde si search_term correspond à un numéro de dossier
+            elif search_term:
+                cleaned_term = search_term.strip()
+                # Format exact de numéro de dossier (ex: 82-4585)
+                is_exact_numero = re.fullmatch(r'\d{2}-\d{4}', cleaned_term)
+                
+                if is_exact_numero:
+                    # Recherche par numéro exact
+                    conditions.append("Numero = %s")
+                    parametres.append(cleaned_term)
+                    logger.info(f"Recherche exacte par numéro: {cleaned_term}")
+                else:
+                    # Recherche floue
+                    conditions.append("(Numero LIKE %s OR nom_usager LIKE %s)")
+                    fuzzy_term = f"%{cleaned_term}%"
+                    parametres.extend([fuzzy_term, fuzzy_term])
+                    logger.info(f"Recherche floue: {cleaned_term}")
+            
+            # Application des autres filtres
+            if statut and statut.lower() != "tous":
+                conditions.append("statut = %s")
+                parametres.append(statut)
+            
+            if instructeur and instructeur.lower() != "tous":
+                conditions.append("instructeur = %s")
+                parametres.append(instructeur)
+            
+            # Gestion des dates
+            if date_debut_creation and date_fin_creation:
+                if date_debut_creation <= date_fin_creation:
+                    conditions.append("date_creation BETWEEN %s AND %s")
+                    parametres.extend([date_debut_creation, date_fin_creation])
+                else:
+                    logger.warning("Date de début postérieure à la date de fin.")
+            elif date_debut_creation:
+                conditions.append("date_creation >= %s")
+                parametres.append(date_debut_creation)
+            elif date_fin_creation:
+                conditions.append("date_creation <= %s")
+                parametres.append(date_fin_creation)
+            
+            # Critères supplémentaires (kwargs)
             for cle, valeur in kwargs.items():
                 if valeur is not None:
                     conditions.append(f"{cle} = %s")
                     parametres.append(valeur)
-
-            requete = f"SELECT * FROM dossiers WHERE {' AND '.join(conditions) if conditions else '1=1'}"
+            
+            # Assemblage de la requête
+            if conditions:
+                requete = f"{base_query} WHERE {' AND '.join(conditions)}"
+            else:
+                requete = base_query
+            
+            # Ajout du tri et de la limite
+            requete += " ORDER BY derniere_modification DESC"
+            
+            # N'ajoutez la limite que si c'est une recherche floue ou si aucun numéro exact n'est fourni
+            if not numero_dossier and not (search_term and re.fullmatch(r'\d{2}-\d{4}', search_term.strip())):
+                if limit:
+                    requete += " LIMIT %s"
+                    parametres.append(limit)
+            
+            logger.info(f"Exécution de la requête: {requete} avec params: {parametres}")
             cursor.execute(requete, parametres)
             resultats = cursor.fetchall()
             
-            cursor.close()
-            conn.close()
+            logger.info(f"{len(resultats)} dossiers trouvés pour les critères.")
             return resultats
+        
         except mysql.connector.Error as erreur:
-            logger.error(f"Erreur de recherche : {erreur}")
+            logger.error(f"Erreur de recherche de dossier: {erreur}")
             return []
+        except Exception as e:
+            logger.error(f"Erreur inattendue dans rechercher_dossier: {e}", exc_info=True)
+            return []
+        finally:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+            if 'conn' in locals() and conn and conn.is_connected():
+                conn.close()
 
 # ================= GESTION DES DOCUMENTS ET EMBEDDINGS =================
 
@@ -165,9 +261,13 @@ def load_all_documents() -> List[Document]:
     logger.info(f"Total : {len(all_docs)} documents chargés dans la base de connaissances")
     return all_docs
 
-def calculate_documents_hash(documents: List[Document]) -> str:
-    """Calcule un hash unique pour l'ensemble des documents."""
-    content = ""
+def calculate_documents_hash(documents: List[Document], embeddings: Embeddings) -> str:
+    """Calcule un hash unique pour l'ensemble des documents et le modèle d'embedding."""
+    content = str(type(embeddings).__name__)  # Ajouter le type d'embedding
+    
+    # Pour OpenAI, inclure aussi le nom du modèle
+    if hasattr(embeddings, "model"):
+        content += embeddings.model
     
     # Trier les documents pour assurer la consistance du hash
     for doc in sorted(documents, key=lambda x: x.page_content):
@@ -182,8 +282,8 @@ def load_cached_embeddings(documents: List[Document], embeddings: Embeddings) ->
     # Créer le répertoire de cache s'il n'existe pas
     os.makedirs(CACHE_DIR, exist_ok=True)
     
-    # Calculer le hash des documents courants
-    current_hash = calculate_documents_hash(documents)
+    # Calculer le hash des documents courants et du modèle d'embedding
+    current_hash = calculate_documents_hash(documents, embeddings)
     hash_file_path = os.path.join(CACHE_DIR, "documents_hash.txt")
     faiss_index_path = os.path.join(CACHE_DIR, "faiss_index")
     
@@ -473,12 +573,17 @@ def init_rag_system():
     
     logger.info("Initialisation du système RAG...")
     
-    # 1. Initialiser le modèle LLM
-    llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
+    # 1. Initialiser le modèle LLM avec Mistral 
+    # llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
+    # 1. Initialiser le modèle LLM avec ChatGPT 
+    llm = init_chat_model("gpt-4o-mini", model_provider="openai")
     logger.info("Modèle LLM initialisé.")
     
-    # 2. Initialiser les embeddings
-    embeddings = MistralAIEmbeddings()
+    # 2. Initialiser les embeddings via mistral
+    #embeddings = MistralAIEmbeddings()
+    
+    # 2. Initialiser les embeddings via chatgpt
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
     logger.info("Embeddings initialisés.")
     
     # 3. Charger les documents
