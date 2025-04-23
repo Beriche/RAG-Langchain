@@ -42,7 +42,7 @@ rules_vector_store = None
 llm = None
 embeddings = None
 db_connected = False
-rechercher_dossier_func = None
+
 
 # Définition de l'état du système
 class State(Dict):
@@ -252,7 +252,7 @@ def load_rules_from_json(rules_path: str) -> List[Document]:
                             "type_usage": global_metadata.get("type_usage", "regle"),
                             "keywords": rule.get("metadata", {}).get("keywords", []),
                             "related_rules": rule.get("metadata", {}).get("related_rules", []),
-                            "type": "rule_document"
+                             "type": "rule_document"
                         }
                         
                         # Créer le document
@@ -282,15 +282,15 @@ def load_all_documents() -> Tuple[List[Document], List[Document]]:
     # 1. Charger les documents des règles depuis des fichiers JSON dans un dossier
     try:
         rules_docs = load_rules_from_json(REGLES_PATH)
-        logger.info(f"Chargement  - {len(rules_docs)} documents de règles chargés.")
+        logger.info(f"Load all docs - {len(rules_docs)} documents de règles chargés.")
     except Exception as e:
-        logger.error(f"Chargement - Erreur lors du chargement des documents de règles: {e}")
+        logger.error(f"Load all docs - Erreur lors du chargement des documents de règles: {e}")
   
     # 2. Charger les documents officiels
     try:
         # S'assurer que le répertoire existe avant de charger
         if not os.path.exists(OFFICIAL_DOCS_PATH):
-            logger.warning(f"Chargement - Répertoire des docs officiels n'existe pas: {OFFICIAL_DOCS_PATH}")
+            logger.warning(f"Load all docs - Répertoire des docs officiels n'existe pas: {OFFICIAL_DOCS_PATH}")
         else:
             official_docs_loader = DirectoryLoader(
                 OFFICIAL_DOCS_PATH,
@@ -496,17 +496,12 @@ def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]
     """Convertit les résultats de la base de données en documents Langchain."""
     documents = [] 
     for resultat in resultats:
-        
-        # Formater les dates si elles sont des objets date/datetime
-        date_creation_str = str(resultat.get('date_creation', 'N/A')) if resultat.get('date_creation') else 'N/A'
-        derniere_modification_str = str(resultat.get('derniere_modification', 'N/A')) if resultat.get('derniere_modification') else 'N/A'
-
         # Contenu formaté à partir des données du dossier
         content = f"""
         - Informations sur le dossier {resultat.get('Numero', 'N/A')}:
         - Nom de l'usager: {resultat.get('nom_usager', 'N/A')}
-        - Date de création: {date_creation_str}
-        - Dernière modification: {derniere_modification_str}
+        - Date de création: {resultat.get('date_creation', 'N/A')}
+        - Dernière modification: {resultat.get('derniere_modification', 'N/A')}
         - Agent affecté: {resultat.get('agent_affecter', 'N/A')}
         - Instructeur: {resultat.get('instructeur', 'N/A')}
         - Statut actuel: {resultat.get('statut', 'N/A')}
@@ -516,14 +511,14 @@ def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]
         
         # Création d'un document Langchain avec les métadonnées
         doc = Document(
-            page_content=content.strip(), # Enlever les espaces au début/fin
+            page_content=content.strip(),
             metadata={
                 "source": "base_de_donnees",
                 "type": "dossier",
                 "numéro": resultat.get('Numero', 'N/A'),
                 "section": "Informations dossier",
-                "page": "N/A", 
-                "update_date": derniere_modification_str
+                "page": "", 
+                "update_date": resultat.get('derniere_modification', 'N/A')
             }
         )
         
@@ -533,32 +528,25 @@ def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]
 
 # ================= FONCTIONS DU GRAPHE RAG =================
 
+# --- search_database --------------------
 def search_database(state: State) -> Dict[str, Any]:
-    """Extrait les numéros de dossier de la question et cherche dans la base de données."""
-    global db_connected, rechercher_dossier_func # Utiliser les globales initialisées
-
-    logger.info("Début de l'étape de recherche dans la database.")
-    
+    """Extrait les numéros de dossier de la question et interroge la DB."""
     dossier_numbers = extract_dossier_number(state["question"])
-    logger.info(f"Recherche DB - Numéros de dossier extraits: {dossier_numbers}")
-    
+    logger.info(f"Numéros extraits: {dossier_numbers}")
+
     db_results = []
-    # Utiliser l'état de connexion et la fonction initialisées globalement
-    if db_connected and rechercher_dossier_func and dossier_numbers:
+    if dossier_numbers:
         try:
-            for num in dossier_numbers:
-                # Appeler la fonction stockée globalement
-                dossier_results = rechercher_dossier_func(numero_dossier=num)
-                db_results.extend(dossier_results)
-            logger.info(f"Recherche DB - Résultats de la base de données: {len(db_results)} entrées trouvées.")
+            db_manager = DatabaseManager()
+            if db_manager.tester_connexion():
+                for num in dossier_numbers:
+                    db_results.extend(db_manager.rechercher_dossier(numero_dossier=num))
+                logger.info(f"{len(db_results)} résultats DB.")
         except Exception as e:
-             logger.error(f"Recherche DB - Erreur lors de la recherche DB via fonction globale: {e}", exc_info=True)
-    elif not db_connected:
-        logger.warning("Recherche DB - Connexion à la base de données non établie. Recherche DB ignorée.")
-    elif not dossier_numbers:
-         logger.info("Recherche DB - Aucuns numéros de dossier extraits. Recherche DB ignorée.")
-         
+            logger.error(f"Recherche DB – erreur: {e}", exc_info=True)
+
     return {"db_results": db_results}
+
 
 def retrieve(state: State) -> Dict[str, Any]:
     """Récupère les documents pertinents basés sur la question, en priorisant les règles."""
@@ -640,6 +628,8 @@ def generate(state: State) -> Dict[str, Any]:
             doc_type = doc.metadata.get("type")
             category = doc.metadata.get("category", "non classifié")
             source = doc.metadata.get("source", "Source inconnue")
+            if doc_type in ("db_data", "dossier") or source == "base_de_donnees":
+                db_docs.append(doc)
             
             # Classification des documents
             if doc_type == "rule_document" or category == "regles":
@@ -687,7 +677,7 @@ def generate(state: State) -> Dict[str, Any]:
         if db_docs:
             db_content = "INFORMATIONS DU DOSSIER DANS LA BASE DE DONNÉES:\n"
             for doc in db_docs:
-                db_content += f"{doc.page_content.strip}\n\n"
+                db_content += f"{doc.page_content.strip()}\n\n"
                 logger.info(f"Génération - Ajout de {len(db_docs)} documents BDD au prompt.")
         
         # Étape 4: Formater les autres connaissances
@@ -841,16 +831,16 @@ def build_graph():
 
 def init_rag_system():
     """Initialise le système RAG complet avec deux vector stores séparés."""
-    global knowledge_vector_store, rules_vector_store, llm, embeddings, db_connected, rechercher_dossier_func
+    global knowledge_vector_store, rules_vector_store, llm, embeddings, db_connected
     
     logger.info("Début début del'initialisation du système RAG...")
     
     # 1. Initialiser les embeddings
     try:
         # 2. Initialiser les embeddings  
-        embeddings = MistralAIEmbeddings()
+        #embeddings = MistralAIEmbeddings()
         # Utiliser OpenAIEmbeddings comme spécifié par l'utilisateur
-        #embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
         logger.info(f"Embeddings initialisés avec succées")
     except Exception as e:
         logger.error(f"Erreur lors de l'initialisation des embeddings: {e}", exc_info=True)
@@ -861,9 +851,9 @@ def init_rag_system():
      # 2. Initialiser le modèle LLM
     try:
         # 1. Initialiser le modèle LLM avec Mistral 
-        llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
+        #llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
         # Utiliser GPT-4o-mini comme spécifié par l'utilisateur
-        #llm = init_chat_model("gpt-4o-mini", model_provider="openai", temperature=0.1) # temperature basse pour un comportement plus déterministe
+        llm = init_chat_model("gpt-4o-mini", model_provider="openai", temperature=0.1) # temperature basse pour un comportement plus déterministe
         logger.info(f"Modèle LLM initialisé avec succées")
     except Exception as e:
         logger.error(f"Erreur lors de l'initialisation du LLM: {e}", exc_info=True)
@@ -882,7 +872,7 @@ def init_rag_system():
             "llm": llm,
             "graph": None, # Le graphe ne peut pas être construit sans LLM/Embeddings
             "db_connected": False,
-            "rechercher_dossier": None
+            
          }
     
     # 3. Charger les documents, avec séparation des règles
@@ -930,15 +920,11 @@ def init_rag_system():
     try:
         db_manager = DatabaseManager()
         db_connected = db_manager.tester_connexion()
-        if db_connected:
-            # Stocker la méthode de recherche si la connexion réussit
-            rechercher_dossier_func = db_manager.rechercher_dossier
-        else:
-            rechercher_dossier_func = None
+        
     except Exception as e:
         logger.error(f"Erreur lors de l'initialisation du DatabaseManager: {e}", exc_info=True)
         db_connected = False
-        rechercher_dossier_func = None
+
     
    # 7. Construire le graphe (peut échouer si LLM est None)
     graph = None
@@ -963,7 +949,8 @@ def init_rag_system():
         "llm": llm, # Peut être None si initialisation échoue
         "graph": graph, # Peut être None si construction échoue
         "db_connected": db_connected,
-        "rechercher_dossier": rechercher_dossier_func # Peut être None si DB non connectée
+        "rechercher_dossier": db_manager.rechercher_dossier
+    
     }
 
 # Initialisation du graphe
