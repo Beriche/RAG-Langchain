@@ -252,7 +252,7 @@ def load_rules_from_json(rules_path: str) -> List[Document]:
                             "type_usage": global_metadata.get("type_usage", "regle"),
                             "keywords": rule.get("metadata", {}).get("keywords", []),
                             "related_rules": rule.get("metadata", {}).get("related_rules", []),
-                             "type": "rule_document"
+                            "type": "rule_document"
                         }
                         
                         # Créer le document
@@ -282,15 +282,15 @@ def load_all_documents() -> Tuple[List[Document], List[Document]]:
     # 1. Charger les documents des règles depuis des fichiers JSON dans un dossier
     try:
         rules_docs = load_rules_from_json(REGLES_PATH)
-        logger.info(f"Load all docs - {len(rules_docs)} documents de règles chargés.")
+        logger.info(f"Chargement  - {len(rules_docs)} documents de règles chargés.")
     except Exception as e:
-        logger.error(f"Load all docs - Erreur lors du chargement des documents de règles: {e}")
+        logger.error(f"Chargement - Erreur lors du chargement des documents de règles: {e}")
   
     # 2. Charger les documents officiels
     try:
         # S'assurer que le répertoire existe avant de charger
         if not os.path.exists(OFFICIAL_DOCS_PATH):
-            logger.warning(f"Load all docs - Répertoire des docs officiels n'existe pas: {OFFICIAL_DOCS_PATH}")
+            logger.warning(f"Chargement - Répertoire des docs officiels n'existe pas: {OFFICIAL_DOCS_PATH}")
         else:
             official_docs_loader = DirectoryLoader(
                 OFFICIAL_DOCS_PATH,
@@ -966,114 +966,7 @@ def init_rag_system():
         "rechercher_dossier": rechercher_dossier_func # Peut être None si DB non connectée
     }
 
-
-
-
-
 # Initialisation du graphe
 graph = build_graph()
 rag_system_state = init_rag_system()
 
-# ================= POINT D'ENTRÉE DU MODULE =================
-
-if __name__ == "__main__":
-    print("Initialisation du système RAG...")
-    try:
-        rag_system_state = init_rag_system()
-        
-        # Récupérer les composants essentiels de l'état initialisé
-        graph = rag_system_state.get("graph")
-        db_connected = rag_system_state.get("db_connected", False)
-        # rechercher_dossier_func est stocké globalement lors de l'initialisation de DatabaseManager dans search_database
-        # llm, knowledge_vector_store, rules_vector_store sont stockés globalement et utilisés par retrieve/generate
-
-        # Afficher les messages d'état du système
-        if rag_system_state.get("llm") is None:
-             print("\n-----------------------------------------------------")
-             print("ERREUR : Le modèle LLM n'a pas pu être initialisé.")
-             print("Vérifiez OPENAI_API_KEY dans votre .env et votre connexion internet.")
-             print("-----------------------------------------------------")
-
-        if graph is None:
-            print("\n-----------------------------------------------------")
-            print("ERREUR CRITIQUE : Le graphe RAG n'a pas pu être construit.")
-            print("Cela peut être dû à une erreur d'initialisation de LLM ou à une erreur dans la définition du graphe.")
-            print("Le programme va s'arrêter.")
-            print("-----------------------------------------------------")
-            exit() # Quitter si le graphe n'est pas initialisé
-
-        if not db_connected:
-            print("\n-----------------------------------------------------")
-            print("AVERTISSEMENT : Impossible de se connecter à la base de données.")
-            print("Les recherches de dossiers ne fonctionneront pas.")
-            print("Vérifiez vos variables SQL dans le fichier .env et l'état du serveur DB.")
-            print("-----------------------------------------------------")
-            
-        if rag_system_state.get("knowledge_vector_store") is None:
-             print("\n-----------------------------------------------------")
-             print("AVERTISSEMENT : Le vector store de connaissances n'a pas été créé/chargé.")
-             print("Aucune information générale ne sera utilisée (docs officiels, échanges).")
-             print("Vérifiez vos chemins DATA_ROOT et les fichiers dans les répertoires.")
-             print("-----------------------------------------------------")
-
-        if rag_system_state.get("rules_vector_store") is None:
-             print("\n-----------------------------------------------------")
-             print("AVERTISSEMENT : Le vector store des règles n'a pas été créé/chargé.")
-             print("Aucune règle ne sera utilisée.")
-             print("Vérifiez vos chemins DATA_ROOT et les fichiers JSON dans le répertoire des règles.")
-             print("-----------------------------------------------------")
-
-        print("\nSystème RAG prêt.")
-        print("Tapez 'exit' pour quitter.")
-
-        # Boucle principale
-        while True:
-            try:
-                user_query = input("\nPosez votre question : ")
-                if user_query.lower() in ["exit", "quit", "quitter"]:
-                    break
-                    
-                # Initialiser l'état pour cette question
-                initial_state = {
-                    "question": user_query,
-                    "context": [],
-                    "db_results": [],
-                    "answer": ""
-                }
-                
-                # Invoquer le graphe
-                print("Traitement en cours...")
-                try:
-                    # Le graphe utilise les variables globales qui ont été peuplées par init_rag_system
-                    # Pas besoin de passer knowledge_vector_store, rules_vector_store, llm car ils sont globaux
-                    final_state = graph.invoke(initial_state)
-                    print("\nRéponse :", final_state.get("answer", "Aucune réponse générée ou une erreur est survenue."))
-                    
-                    # Optionnel: Afficher les sources utilisées pour debug
-                    # print("\n--- Sources ---")
-                    # if final_state.get("context"):
-                    #     for doc in final_state["context"]:
-                    #          source = doc.metadata.get("source", "Inconnue")
-                    #          category = doc.metadata.get("category", "N/A")
-                    #          doc_type = doc.metadata.get("type", "N/A")
-                    #          rule_num = doc.metadata.get("rule_number", "")
-                    #          title = doc.metadata.get("title", "")
-                    #          print(f"- [Cat: {category}, Type: {doc_type}, Source: {source}{f' Rule: {rule_num} ({title})' if rule_num != 'N/A' else ''}]")
-                    # else:
-                    #     print("Aucune source utilisée.")
-                    # print("---------------")
-
-                except Exception as e:
-                    logger.error(f"Erreur lors de l'exécution du graphe: {e}", exc_info=True)
-                    print(f"\nUne erreur est survenue lors du traitement de votre question par le graphe: {e}")
-                    
-            except KeyboardInterrupt:
-                print("\nProgramme interrompu par l'utilisateur.")
-                break
-            except Exception as e:
-                logger.error(f"\nErreur inattendue dans la boucle principale: {e}", exc_info=True)
-                print(f"\nUne erreur inattendue s'est produite: {e}")
-
-    except Exception as e:
-        logger.critical(f"Erreur fatale lors de l'initialisation principale du système RAG: {e}", exc_info=True)
-        print(f"\nUne erreur fatale est survenue au démarrage du système RAG: {e}")
