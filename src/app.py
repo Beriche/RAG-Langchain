@@ -268,7 +268,7 @@ def initialize_rag_system() -> bool:
 
         status_text.info("2/3 Appel de la fonction d'initialisation RAG...")
         progress_bar.progress(60)
-        # --- Appel de la Vfonction d'initialisation du module RAG---
+        # --- Appel de la fonction d'initialisation du module RAG---
         if hasattr(rag_module, 'init_rag_system') and callable(rag_module.init_rag_system):
              st.session_state.rag_components = rag_module.init_rag_system()
              

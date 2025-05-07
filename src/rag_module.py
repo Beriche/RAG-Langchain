@@ -1,65 +1,78 @@
-import os 
+import os
+from pyexpat import model
 import re
 import hashlib
-import mysql.connector  
+import mysql.connector
 import logging
 import json
 import glob
 from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
-from langchain_mistralai import MistralAIEmbeddings
-from langchain_openai import OpenAIEmbeddings
-from langchain.document_loaders import DirectoryLoader, TextLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Langchain Imports 
 from langchain_core.documents import Document
-from langchain.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
-from langgraph.graph import StateGraph, END, START
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+# Importer les modèles spécifiques utilisés
+from langchain_mistralai.chat_models import ChatMistralAI
+from langchain_mistralai import MistralAIEmbeddings
+# Décommenter si OpenAI est utilisé
+from langchain_openai.embeddings import OpenAIEmbeddings 
+from langchain_openai.chat_models import ChatOpenAI
+from langgraph.graph import StateGraph, END, START
+from openai import OpenAI
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("rag_module")
 
+
+
 # Chargement des variables d'environnement
 load_dotenv()
 
-#client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Chemins vers les répertoires de données
-DATA_ROOT = os.getenv("DATA_ROOT", "../data")
+DATA_ROOT = os.getenv("DATA_ROOT", "../data") # S'assurer que ce chemin est correct par rapport à l'exécution
 ECHANGES_PATH = os.path.join(DATA_ROOT, "echanges")
-REGLES_PATH = os.path.join(DATA_ROOT, "regles") 
+REGLES_PATH = os.path.join(DATA_ROOT, "regles")
 OFFICIAL_DOCS_PATH = os.path.join(DATA_ROOT, "docs_officiels")
-CACHE_DIR = "./cache"  # Répertoire pour le cache
+CACHE_DIR = "./cache"  # Répertoire pour le cache (sera créé s'il n'existe pas)
 
-# Variables globales
-knowledge_vector_store = None
-rules_vector_store = None
-llm = None
-embeddings = None
-db_connected = False
+# --- VARIABLES GLOBALES ---
+# Séparation des vector stores
+rules_vector_store: Optional[VectorStore] = None
+official_docs_vector_store: Optional[VectorStore] = None
+echanges_vector_store: Optional[VectorStore] = None
+# Modèles et état de la connexion BDD
+llm: Optional[Any] = None # Type générique, sera ChatMistralAI ou ChatOpenAI
+embeddings: Optional[Embeddings] = None
+db_connected: bool = False
+db_manager: Optional['DatabaseManager'] = None # Pour garder une instance
 
 
-# Définition de l'état du système
+# Définition de l'état du graphe LangGraph
 class State(Dict):
     """Structure pour représenter l'état du système RAG."""
-    question: str #Question posée par l'utilisateur
-    context: List[Document] #Contexte récupéré pour la question
-    db_results: List[Dict[str, Any]]  # Résultats de la base de données
+    question: str # Question posée par l'utilisateur
+    context: List[Document] # Contexte récupéré pour la question
+    db_results: List[Dict[str, Any]]  # Résultats bruts de la base de données
     answer: str # Réponse générée
 
-#================= GESTION DE LA BASE DE DONNÉES =================
 
+#================= GESTION DE LA BASE DE DONNÉES =================
 class DatabaseManager:
     """Gestionnaire de connexion et d'interrogation de la base de données."""
-    
+
     def __init__(self):
-        """Initialise la connexion à la base de données."""
-     
+        """Initialise la configuration de la base de données."""
         self.config = {
             'user': os.getenv('SQL_USER'),
             'password': os.getenv('SQL_PASSWORD', ''),
@@ -67,26 +80,30 @@ class DatabaseManager:
             'database': os.getenv('SQL_DB'),
             'port': int(os.getenv('SQL_PORT', '3306'))
         }
-        
-        # Vérification des variables essentielles
+        # Vérification initiale des variables essentielles
         if not all([self.config['user'], self.config['host'], self.config['database']]):
-            logger.error("Variables essentielles manquantes pour la DB : SQL_USER, SQL_HOST ou SQL_DB.")
-            pass
-    
+            logger.error("Variables d'environnement manquantes pour la connexion DB: SQL_USER, SQL_HOST ou SQL_DB ne sont pas définies.")
+            # L'initialisation continue, mais tester_connexion échouera probablement.
+
+    def _is_config_valid(self) -> bool:
+        """Vérifie si la configuration essentielle est présente."""
+        valid = all([self.config['user'], self.config['host'], self.config['database']])
+        if not valid:
+             logger.warning("Configuration DB incomplète (SQL_USER, SQL_HOST, SQL_DB).")
+        return valid
+
     def tester_connexion(self) -> bool:
         """Teste la connexion à la base de données."""
+        if not self._is_config_valid():
+            return False
+
+        conn = None
+        cursor = None
         try:
-            # S'assurer que la config est valide avant de tenter la connexion
-            if not all([self.config['user'], self.config['host'], self.config['database']]):
-                 logger.warning("Impossible de tester la connexion DB, configuration incomplète.")
-                 return False
-                 
-            conn = mysql.connector.connect(**self.config)
+            conn = mysql.connector.connect(**self.config, connect_timeout=5) # Timeout court
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             cursor.fetchone()
-            cursor.close()
-            conn.close()
             logger.info("Connexion réussie à la base de données.")
             return True
         except mysql.connector.Error as erreur:
@@ -95,11 +112,15 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Erreur inattendue lors du test de connexion DB: {e}", exc_info=True)
             return False
-    
-    
+        finally:
+            if cursor:
+                cursor.close()
+            if conn and conn.is_connected():
+                conn.close()
+
     def rechercher_dossier(self,
                       search_term: Optional[str] = None,
-                      numero_dossier: Optional[str] = None, 
+                      numero_dossier: Optional[str] = None,
                       statut: Optional[str] = None,
                       instructeur: Optional[str] = None,
                       date_debut_creation: Optional[date] = None,
@@ -107,853 +128,1085 @@ class DatabaseManager:
                       limit: Optional[int] = 50,
                       **kwargs) -> List[Dict[str, Any]]:
         """
-        Recherche des dossiers dans la base de données 
+        Recherche des dossiers dans la base de données avec gestion des erreurs et fermeture de connexion.
         """
+        if not self._is_config_valid():
+            return []
+
+        conn = None
+        cursor = None
         try:
-            # On  Vérifie la connexion avant d'essayer d'interroger
-            conn = mysql.connector.connect(**self.config)
-            cursor = conn.cursor(dictionary=True)
-            
-            # Construction de la requête SQL
+            conn = mysql.connector.connect(**self.config, connect_timeout=10) # Timeout un peu plus long pour query
+            cursor = conn.cursor(dictionary=True) # Résultats sous forme de dict
+
             base_query = "SELECT * FROM dossiers"
             conditions = []
             parametres = []
-            
-            # Si numero_dossier est fourni, c'est la priorité absolue
+
+            # Priorité au numéro de dossier s'il est fourni directement
             if numero_dossier:
                 conditions.append("Numero = %s")
                 parametres.append(numero_dossier.strip())
-            # Sinon, on regarde si search_term correspond à un numéro de dossier
+                logger.info(f"Recherche BDD par numéro direct: {numero_dossier.strip()}")
+            # Sinon, analyser search_term
             elif search_term:
                 cleaned_term = search_term.strip()
-                # Format exact de numéro de dossier (ex: 82-4585)
-                is_exact_numero = re.fullmatch(r'\d{2}-\d{4}', cleaned_term)
-                
+                # Format exact XX-YYYY ou XX YYYY
+                is_exact_numero = re.fullmatch(r'\d{2}[-\s]?\d{4}', cleaned_term)
                 if is_exact_numero:
-                    # Recherche par numéro exact
+                    # Normaliser au format XX-YYYY pour la recherche
+                    normalized_numero = re.sub(r'\s', '-', cleaned_term)
                     conditions.append("Numero = %s")
-                    parametres.append(cleaned_term)
-                    logger.info(f"Recherche exacte par numéro: {cleaned_term}")
+                    parametres.append(normalized_numero)
+                    logger.info(f"Recherche BDD par numéro exact détecté dans search_term: {normalized_numero}")
                 else:
-                    # Recherche floue
                     conditions.append("(Numero LIKE %s OR nom_usager LIKE %s)")
                     fuzzy_term = f"%{cleaned_term}%"
                     parametres.extend([fuzzy_term, fuzzy_term])
-                    logger.info(f"Recherche floue: {cleaned_term}")
-            
-            # Application des autres filtres
+                    logger.info(f"Recherche BDD floue (numéro/nom) pour: {cleaned_term}")
+
+            # Autres filtres
             if statut and statut.lower() != "tous":
                 conditions.append("statut = %s")
                 parametres.append(statut)
-            
             if instructeur and instructeur.lower() != "tous":
                 conditions.append("instructeur = %s")
                 parametres.append(instructeur)
-            
-            # Gestion des dates
-            if date_debut_creation and date_fin_creation:
-                if date_debut_creation <= date_fin_creation:
-                    conditions.append("date_creation BETWEEN %s AND %s")
-                    parametres.extend([date_debut_creation, date_fin_creation])
-                else:
-                    logger.warning("Date de début postérieure à la date de fin.")
-            elif date_debut_creation:
+            if date_debut_creation:
                 conditions.append("date_creation >= %s")
                 parametres.append(date_debut_creation)
-            elif date_fin_creation:
-                conditions.append("date_creation <= %s")
-                parametres.append(date_fin_creation)
-            
-            # Critères supplémentaires (kwargs)
+            if date_fin_creation:
+                 conditions.append("date_creation <= %s")
+                 parametres.append(date_fin_creation)
+                 # Vérification simple de cohérence
+                 if date_debut_creation and date_debut_creation > date_fin_creation:
+                      logger.warning("Date de début postérieure à la date de fin dans la recherche BDD.")
+
+            # Critères kwargs (utiliser avec prudence si les clés viennent de l'extérieur)
             for cle, valeur in kwargs.items():
                 if valeur is not None:
-                    conditions.append(f"{cle} = %s")
+                    # Exemple simple, pourrait nécessiter une validation des clés
+                    conditions.append(f"`{cle}` = %s") # Backticks pour noms de colonnes
                     parametres.append(valeur)
-            
-            # Assemblage de la requête
+
+            # Construction de la requête finale
+            requete = base_query
             if conditions:
-                requete = f"{base_query} WHERE {' AND '.join(conditions)}"
-            else:
-                requete = base_query
-            
-            # Ajout du tri et de la limite
-            requete += " ORDER BY derniere_modification DESC"
-            
-            # Ajoutez la limite que si c'est une recherche floue ou si aucun numéro exact n'est fourni
-            if not numero_dossier and not (search_term and re.fullmatch(r'\d{2}-\d{4}', search_term.strip())):
-                if limit:
-                    requete += " LIMIT %s"
-                    parametres.append(limit)
-            
-            logger.info(f"Exécution de la requête: {requete} avec params: {parametres}")
-            cursor.execute(requete, parametres)
+                requete += " WHERE " + " AND ".join(conditions)
+            requete += " ORDER BY derniere_modification DESC" # Trier par défaut
+
+            # Appliquer la limite seulement si ce n'est pas une recherche par numéro exact
+            apply_limit = True
+            if numero_dossier or (search_term and re.fullmatch(r'\d{2}[-\s]?\d{4}', search_term.strip())):
+                apply_limit = False
+
+            if apply_limit and limit is not None and limit > 0:
+                requete += " LIMIT %s"
+                parametres.append(limit)
+
+            logger.info(f"Exécution requête BDD: {requete} | Params: {parametres}")
+            cursor.execute(requete, tuple(parametres)) # Exécuter avec un tuple de paramètres
             resultats = cursor.fetchall()
-            
-            logger.info(f"{len(resultats)} dossiers trouvés pour les critères.")
+            logger.info(f"{len(resultats)} dossiers trouvés dans la BDD.")
             return resultats
-        
+
         except mysql.connector.Error as erreur:
-            logger.error(f"Erreur de recherche de dossier: {erreur}")
+            logger.error(f"Erreur lors de la recherche BDD: {erreur}")
             return []
         except Exception as e:
             logger.error(f"Erreur inattendue dans rechercher_dossier: {e}", exc_info=True)
             return []
         finally:
-            # Fermer le curseur et la connexion
-            if 'cursor' in locals() and cursor:
+            # Assurer la fermeture du curseur et de la connexion
+            if cursor:
                 cursor.close()
-            if 'conn' in locals() and conn and conn.is_connected():
+            if conn and conn.is_connected():
                 conn.close()
 
-# ===GESTION DES DOCUMENTS ET EMBEDDINGS ====
+# === GESTION DES DOCUMENTS ET EMBEDDINGS ====
 
-#Chargement des regles
+def format_table(table_data: Dict[str, Any]) -> str:
+    """Formate un dictionnaire représentant une table en Markdown."""
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+    title = table_data.get("title")
+    if not headers or not rows:
+        return ""
+
+    table_str = ""
+    if title:
+        table_str += f"**{title}**\n"
+
+    header_line = " | ".join(str(h).strip() for h in headers)
+    separator = " | ".join(["---"] * len(headers))
+    row_lines = []
+    for row in rows:
+        cells = []
+        for h in headers:
+            cell_content = row.get(h, "")
+            # Si le contenu est une liste, joindre avec des sauts de ligne DANS la cellule
+            if isinstance(cell_content, list):
+                 # Utiliser <br> pour saut de ligne en Markdown table si nécessaire, ou juste joindre
+                 cell_str = ", ".join(str(item).strip() for item in cell_content if str(item).strip())
+            else:
+                 cell_str = str(cell_content).strip()
+            cells.append(cell_str)
+        row_lines.append(" | ".join(cells))
+
+    table_str += "\n".join([header_line, separator] + row_lines)
+    return table_str.strip()
+
+def format_content(block_type: str, content: Any) -> str:
+    """
+    Formate le contenu d'un bloc selon son type en texte lisible,
+    gérant les structures simples et complexes/imbriquées.
+    """
+    text_parts = [] # Collecte les morceaux de texte formaté
+
+    if not content:
+        return ""
+
+    # --- Types simples ---
+    if block_type in ["text", "paragraph", "footer_info", "link"]:
+        # Pour footer_info et link, le contenu est un dict, on cherche 'text'
+        if isinstance(content, dict):
+            text = content.get("text", "")
+            if block_type == "link":
+                 text = f"Lien : {text}" # Préciser que c'est un lien
+        elif isinstance(content, str):
+             text = content
+        else:
+             text = str(content) # Fallback
+        cleaned_text = text.strip()
+        if cleaned_text:
+            text_parts.append(cleaned_text)
+
+    elif block_type == "subheading": # Trouvé dans les QA complexes
+        if isinstance(content, dict) and "text" in content:
+             text_parts.append(f"**{content['text'].strip()}**")
+        elif isinstance(content, str):
+             text_parts.append(f"**{content.strip()}**")
+
+
+    # --- Listes ---
+    elif block_type == "list":
+        items_to_format = []
+        # Contenu peut être une liste directe (moins courant dans votre schéma) ou un dict avec 'items'
+        list_content = content.get("items", []) if isinstance(content, dict) else (content if isinstance(content, list) else [])
+
+        for item in list_content:
+            if isinstance(item, dict):
+                # Gérer des items de liste complexes si nécessaire (pas vu dans vos exemples)
+                # Pour l'instant, on convertit le dict en string simple
+                item_text = json.dumps(item, ensure_ascii=False) # Ou une représentation plus sympa
+            else:
+                item_text = str(item).strip()
+
+            if item_text:
+                 items_to_format.append(f"- {item_text}")
+        if items_to_format:
+             text_parts.append("\n".join(items_to_format))
+
+    elif block_type == "list_structured":
+        title = content.get("title", "")
+        items = content.get("items", [])
+        if title:
+            text_parts.append(f"**{title}**")
+        structured_list_parts = []
+        for item in items:
+            item_str_parts = []
+            # Formatage spécifique pour la structure "demandeur/documents"
+            if "demandeur" in item and "documents" in item:
+                 item_str_parts.append(f"  * Demandeur : {item['demandeur']}")
+                 docs = item['documents']
+                 if isinstance(docs, list):
+                     doc_lines = [f"    - {doc}" for doc in docs if str(doc).strip()]
+                     if doc_lines:
+                          item_str_parts.append("  * Documents :\n" + "\n".join(doc_lines))
+                 else:
+                     item_str_parts.append(f"  * Documents : {docs}") # Fallback
+            else: # Formatage générique clé: valeur pour d'autres structures
+                 for key, value in item.items():
+                     item_str_parts.append(f"  * {key.capitalize()} : {value}")
+            structured_list_parts.append("\n".join(item_str_parts))
+        if structured_list_parts:
+             text_parts.append("\n\n".join(structured_list_parts))
+
+
+    # --- Questions/Réponses ---
+    elif block_type == "qa":
+        if isinstance(content, dict):
+            question = content.get("question", "")
+            answer_raw = content.get("answer") or content.get("answer_list") # Priorité à 'answer'
+            answer_heading = content.get("answer_heading") # Pour "Dépenses non éligibles :"
+            answer_intro = content.get("answer_intro") # Pour "Le prestataire..."
+
+            # Format Question
+            if question:
+                 text_parts.append(f"**Question :** {str(question).strip()}")
+
+            # Format Answer
+            answer_formatted_parts = []
+            if answer_heading:
+                answer_formatted_parts.append(f"*{answer_heading}*")
+            if answer_intro:
+                answer_formatted_parts.append(answer_intro.strip())
+
+            if isinstance(answer_raw, list):
+                 # Cas 1: Liste de strings (answer_list)
+                 if all(isinstance(item, str) for item in answer_raw):
+                      list_items = [f"- {item.strip()}" for item in answer_raw if item.strip()]
+                      if list_items:
+                          answer_formatted_parts.append("\n".join(list_items))
+                 # Cas 2: Liste de dictionnaires (structure complexe dans 'answer')
+                 elif all(isinstance(item, dict) for item in answer_raw):
+                      for sub_block in answer_raw:
+                          sub_type = sub_block.get("type")
+                          sub_content = sub_block.get("content", sub_block.get("text", sub_block.get("items", sub_block.get("table", sub_block)))) # Essayer plusieurs clés
+                          # Appel récursif pour formater les sous-blocs
+                          formatted_sub_content = format_content(sub_type, sub_content)
+                          if formatted_sub_content:
+                              answer_formatted_parts.append(formatted_sub_content)
+            # Cas 3: Réponse simple (string)
+            elif isinstance(answer_raw, str):
+                 cleaned_answer = answer_raw.strip()
+                 if cleaned_answer:
+                      answer_formatted_parts.append(cleaned_answer)
+
+            # Assembler la partie Réponse
+            if answer_formatted_parts:
+                 text_parts.append("**Réponse :**\n" + "\n".join(answer_formatted_parts))
+
+    # --- Tables ---
+    elif block_type in ["qa_table", "table"]:
+        if isinstance(content, dict):
+            # Si c'est qa_table, il y a une question
+            question = content.get("question", "")
+            if block_type == "qa_table" and question:
+                 text_parts.append(f"**Question :** {str(question).strip()}")
+
+            table_data = content.get("table", content) # 'table' dans qa_table, ou 'content' direct pour type 'table'
+            formatted_table = format_table(table_data)
+            if formatted_table:
+                 text_parts.append(f"**Tableau :**\n{formatted_table}")
+
+
+    # --- Steps ---
+    elif block_type == "qa_steps":
+         if isinstance(content, dict):
+             question = content.get("question", "")
+             steps = content.get("steps", [])
+             if question:
+                  text_parts.append(f"**Question :** {str(question).strip()}")
+             steps_formatted_parts = []
+             for step in steps:
+                 step_num = step.get("step", "?")
+                 title = step.get("title", "")
+                 description = step.get("description", "")
+                 step_part = f"**Étape {step_num} : {title}**"
+                 if isinstance(description, list):
+                      desc_items = [f"- {d.strip()}" for d in description if d.strip()]
+                      if desc_items:
+                           step_part += "\n" + "\n".join(desc_items)
+                 elif isinstance(description, str) and description.strip():
+                      step_part += f"\n{description.strip()}"
+                 steps_formatted_parts.append(step_part)
+             if steps_formatted_parts:
+                  text_parts.append("**Étapes :**\n" + "\n\n".join(steps_formatted_parts))
+
+
+    # --- Contact Info (souvent imbriqué) ---
+    elif block_type == "contact_info":
+         if isinstance(content, dict):
+             org = content.get("organisation", "")
+             methods = content.get("methods", [])
+             avail = content.get("availability", "")
+             contact_parts = []
+             if org:
+                  contact_parts.append(f"- Organisation : {org}")
+             if methods:
+                  method_lines = [f"  - {m.get('type', '?')} : {m.get('value', 'N/A')}" for m in methods]
+                  contact_parts.append("- Méthodes de contact :\n" + "\n".join(method_lines))
+             if avail:
+                  contact_parts.append(f"- Disponibilité : {avail}")
+             if contact_parts:
+                 text_parts.append("**Informations de Contact :**\n" + "\n".join(contact_parts))
+
+    # --- Gestion des types inconnus ou non explicitement gérés ---
+    else:
+        # Essayer une conversion simple en string, si pertinent
+        str_content = str(content).strip()
+        if len(str_content) > 20: # Éviter les "[{...}]" ou "{}" vides
+            logger.warning(f"Type de bloc '{block_type}' non géré explicitement, tentative de conversion str.")
+            text_parts.append(f"[{block_type.upper()}] : {str_content}") # Indiquer le type non géré
+
+    # Retourner le texte assemblé pour ce bloc
+    return "\n".join(text_parts).strip()
+
+
+def load_official_docs_from_json(official_docs_path: str) -> List[Document]:
+    """Charge les documents JSON en extrayant tous les types de blocs pour le contexte RAG."""
+    docs: List[Document] = []
+    if not os.path.isdir(official_docs_path):
+        logger.warning(f"Répertoire non trouvé : {official_docs_path}")
+        return docs
+
+    # Correction: Utiliser *.json pour trouver tous les fichiers
+    json_files = glob.glob(os.path.join(official_docs_path, "*.json"))
+    logger.info(f"{len(json_files)} fichiers JSON trouvés dans {official_docs_path}.")
+
+    for json_file in json_files:
+        logger.info(f"--- Traitement de {os.path.basename(json_file)} ---")
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            doc_meta = data.get("document_metadata", {})
+            global_meta = data.get("global_block_metadata", {})
+            blocks_data = []
+            block_count = 0 # Compteur pour le log final du fichier
+
+            for page in data.get("pages", []):
+                page_num = page.get("page_number", "N/P") # Page non spécifiée
+                for section in page.get("sections", []):
+                    title = section.get("section_title", "Sans Titre")
+                    sec_id = section.get("section_id", "N/A")
+                    logger.debug(f"  Traitement Section: '{title}' (ID: {sec_id}, Page: {page_num})")
+                    for block_index, block in enumerate(section.get("content_blocks", [])):
+                        block_type = block.get("type", "unknown")
+                        content = block.get("content")
+                        block_id = block.get("metadata", {}).get("block_id", f"sec_{sec_id}_idx_{block_index}") # Créer un ID si absent
+
+                        logger.debug(f"    Traitement Bloc: Type='{block_type}', ID='{block_id}'")
+
+                        # --- Appel de la fonction format_content améliorée ---
+                        text = format_content(block_type, content)
+                        # --- Fin de l'appel ---
+
+                        if text:
+                            header = f"Page {page_num}"
+                            if title != "Sans Titre": # N'afficher que si pertinent
+                                header += f" - Section : {title}"
+                            # Ajouter l'ID du bloc et le type peut aider au débogage ou à un ciblage fin
+                            blocks_data.append(f"### {header} (Type : {block_type} / ID: {block_id})\n\n{text}")
+                            block_count += 1
+                            logger.debug(f"      -> Bloc {block_type} extrait (ID: {block_id})")
+                        else:
+                            logger.debug(f"      -> Bloc {block_type} vide ou non traité (ID: {block_id})")
+
+            if not blocks_data:
+                logger.warning(f"Aucun contenu textuel pertinent extrait de {os.path.basename(json_file)}")
+                continue
+
+            full_content = "\n\n---\n\n".join(blocks_data) # Séparateur clair entre blocs
+
+            # Création des métadonnées (identique à votre version)
+            metadata = {
+                "source": json_file,
+                "source_file": os.path.basename(json_file),
+                "document_title": doc_meta.get("document_title"),
+                "program_name": doc_meta.get("program_name"),
+                "category": "docs_officiels",
+                "type": "knowledge_document",
+                "date_update": global_meta.get("date_update") or doc_meta.get("date_update"),
+                "tags": doc_meta.get("tags", []),
+                "priority": doc_meta.get("priority", 100),
+            }
+            metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+
+            docs.append(Document(page_content=full_content, metadata=metadata))
+            logger.info(f"Document créé pour {os.path.basename(json_file)} avec {block_count} bloc(s) textuel(s) extrait(s).")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Erreur JSON dans {json_file} : {e}")
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors du traitement de {json_file} : {e}", exc_info=True) # Ajout traceback
+
+    logger.info(f"Chargement terminé. {len(docs)} documents créés au total.")
+    return docs
+
+
 def load_rules_from_json(rules_path: str) -> List[Document]:
-    """Charge les règles depuis les fichiers JSON dans un répertoire et les convertit en documents Langchain."""
-    
-    try:
-        if not os.path.exists(rules_path):
-             logger.warning(f"Chargement règles - Répertoire des règles n'existe pas: {rules_path}")
-             return []
-         
-        # Récuperer tous les fichiers JSON dans le répertoire
-        json_files = glob.glob(os.path.join(rules_path, "*.json"))
-        logger.info(f"Chargement règles - Fichiers trouvés:  {json_files}")
-        
-        if not json_files:
-            logger.warning(f"Chargement règles - Aucun fichier JSON trouvé dans{rules_path}")
-            return []
-        
-        rules_docs = []
-        
-        # Traiter chaque fichier JSON
-        for json_file in json_files:
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    rules_data = json.load(f)
-                    
-                    global_metadata = rules_data.get("global_rule_metadata", {})
-                    
-                    for rule in rules_data.get("rules", []):
-                        content = f"""
-                        [Règle n°{rule.get('rule_number', 'N/A')}] Titre: {rule.get('title', 'Sans titre')}
-                        Contexte: {rule.get('context', 'Non spécifié')}
-                        Action: {rule.get('action', 'Non spécifiée')}
-                        """
-                        
-                        # Fusionner les métadonnées globales et spécifiques
-                        metadata = {
-                            "source": os.path.basename(json_file),
-                            "category": "regles",
-                            "rule_number": rule.get("rule_number", "N/A"),
-                            "title": rule.get("title", "Sans titre"),
-                            "tags": rule.get("metadata", {}).get("tags", []),
-                            "priority": global_metadata.get("priority", 100), 
-                            "type_usage": global_metadata.get("type_usage", "regle"),
-                            "keywords": rule.get("metadata", {}).get("keywords", []),
-                            "related_rules": rule.get("metadata", {}).get("related_rules", []),
-                             "type": "rule_document"
-                        }
-                        
-                        # Créer le document
-                        doc = Document(
-                            page_content=content,
-                            metadata=metadata
-                        )
-                    
-                        rules_docs.append(doc)
-            except json.JSONDecodeError as je:
-                    logger.error(f"Chargement règles - Erreur décodage JSON pour {json_file}: {je}")
-            except Exception as e:
-                logger.error(f"Chargement règles - Erreur traitement fichier {json_file}: {e}", exc_info=True)
-        
-        logger.info(f"Chargement règles - {len(rules_docs)} règles chargées.")
-        return rules_docs
-        
-    except Exception as e:
-        logger.error(f"Chargement règles - Erreur globale: {e}", exc_info=True)
-        return []
-
-def load_all_documents() -> Tuple[List[Document], List[Document]]:
-    """Charge tous les documents des différentes sources."""
-    knowledge_docs = []
+    """Charge les règles depuis des fichiers JSON."""
     rules_docs = []
-    
-    # 1. Charger les documents des règles depuis des fichiers JSON dans un dossier
-    try:
-        rules_docs = load_rules_from_json(REGLES_PATH)
-        logger.info(f"Load all docs - {len(rules_docs)} documents de règles chargés.")
-    except Exception as e:
-        logger.error(f"Load all docs - Erreur lors du chargement des documents de règles: {e}")
-  
-    # 2. Charger les documents officiels
-    try:
-        # S'assurer que le répertoire existe avant de charger
-        if not os.path.exists(OFFICIAL_DOCS_PATH):
-            logger.warning(f"Load all docs - Répertoire des docs officiels n'existe pas: {OFFICIAL_DOCS_PATH}")
-        else:
-            official_docs_loader = DirectoryLoader(
-                OFFICIAL_DOCS_PATH,
-                glob="*.txt",
-                loader_cls=TextLoader,
-                loader_kwargs={"encoding": "utf-8"}
-            ) 
-            official_docs = official_docs_loader.load()
-            for doc in official_docs:
-                doc.metadata["category"] = "docs_officiels"
-                doc.metadata["type"] = "knowledge_document" 
-            logger.info(f"Document générale - {len(official_docs)} documents de docs_officiels chargés.")
-            knowledge_docs.extend(official_docs)
-    except Exception as e:
-        logger.error(f"Document générale - Erreur lors du chargement des documents officiels: {e}")
-        
+    if not os.path.isdir(rules_path):
+        logger.warning(f"Répertoire des règles non trouvé: {rules_path}")
+        return rules_docs
 
-    # 3. Charger les documents des échanges
-    try:
-        # S'assurer que le répertoire existe avant de charger
-        if not os.path.exists(ECHANGES_PATH):
-            logger.warning(f"Document générale - Répertoire des échanges n'existe pas: {ECHANGES_PATH}")
-        else:
+    json_files = glob.glob(os.path.join(rules_path, "*.json"))
+    logger.info(f"Chargement règles: {len(json_files)} fichiers JSON trouvés.")
+
+    for json_file in json_files:
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                rules_data = json.load(f)
+
+            global_metadata = rules_data.get("global_rule_metadata", {})
+            file_rules = rules_data.get("rules", [])
+
+            if not file_rules:
+                 logger.warning(f"Aucune règle trouvée dans {json_file}.")
+                 continue
+
+            for rule in file_rules:
+                # Formatage du contenu de la règle
+                content = f"""**Règle N°{rule.get('rule_number', 'N/A')} : {rule.get('title', 'Sans titre')}**
+*Contexte d'application* : {rule.get('context', 'Non spécifié')}
+*Action/Directive* : {rule.get('action', 'Non spécifiée')}"""
+
+                # Création des métadonnées
+                metadata = {
+                    "source": json_file,
+                    "source_file": os.path.basename(json_file),
+                    "category": "regles", # Catégorie fixe
+                    "type": "rule_document", # Type fixe
+                    "rule_number": rule.get("rule_number", "N/A"),
+                    "title": rule.get("title", "Sans titre"),
+                    "tags": rule.get("metadata", {}).get("tags", []),
+                    "priority": global_metadata.get("priority", 50), # Priorité plus élevée pour règles
+                    "keywords": rule.get("metadata", {}).get("keywords", []),
+                }
+                metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+
+                rules_docs.append(Document(page_content=content.strip(), metadata=metadata))
+
+        except json.JSONDecodeError as je:
+            logger.error(f"Erreur de décodage JSON dans {json_file}: {je}")
+        except Exception as e:
+            logger.error(f"Erreur lors du traitement du fichier de règles {json_file}: {e}", exc_info=True)
+
+    logger.info(f"Chargement règles terminé. {len(rules_docs)} règles créées.")
+    return rules_docs
+
+def load_all_documents() -> Tuple[List[Document], List[Document], List[Document]]:
+    """
+    Charge tous les documents (officiels, échanges, règles) et les retourne en listes séparées.
+    """
+    logger.info("Début du chargement de tous les types de documents...")
+
+    # Charger les règles
+    rules_docs = load_rules_from_json(REGLES_PATH)
+
+    # Charger les documents officiels
+    official_docs = load_official_docs_from_json(OFFICIAL_DOCS_PATH)
+
+    # Charger les documents d'échanges (TXT)
+    echanges_docs: List[Document] = []
+    if os.path.isdir(ECHANGES_PATH):
+        try:
             echanges_loader = DirectoryLoader(
                 ECHANGES_PATH,
-                glob="**/*txt",
+                glob="**/*.txt", # Recherche des .txt dans tous les sous-dossiers
                 loader_cls=TextLoader,
                 loader_kwargs={"encoding": "utf-8"},
-                recursive=True
+                recursive=True,
+                show_progress=True,
+                use_multithreading=True, # Peut accélérer si beaucoup de petits fichiers
+                # silent_errors=True # Pourrait masquer des problèmes de chargement
             )
-            echanges_docs = echanges_loader.load()
-            for doc in echanges_docs:
-                doc.metadata["category"] = "echanges"
-                doc.metadata["type"] = "knowledge_document" 
-                
-            logger.info(f"Document générale - {len(echanges_docs)} documents d'échanges chargés.")
-            knowledge_docs.extend(echanges_docs)
-    except Exception as e:
-        logger.error(f"Document générale - Erreur lors du chargement des dossiers d'échanges: {e}")
-    
-    logger.info(f"Document générale - Total : {len(knowledge_docs)} documents de connaissances et {len(rules_docs)} règles chargés")
-    return knowledge_docs, rules_docs
+            loaded_echanges = echanges_loader.load() # Charge les documents
+            logger.info(f"Chargement échanges: {len(loaded_echanges)} fichiers TXT trouvés et chargés.")
 
-#Calcul du hash des documents
+            # Ajouter/Vérifier les métadonnées pour chaque document d'échange
+            for doc in loaded_echanges:
+                if not hasattr(doc, 'metadata'): # Sécurité si un loader retourne un objet sans metadata
+                    doc.metadata = {}
+                doc.metadata["category"] = "echanges"
+                doc.metadata["type"] = "echange_document"
+                # Essayer d'extraire le nom de fichier depuis la source
+                source_path = doc.metadata.get("source", "inconnu.txt")
+                doc.metadata["source_file"] = os.path.basename(source_path)
+                # Garder le chemin complet aussi
+                doc.metadata["source"] = source_path
+                # Nettoyer
+                doc.metadata = {k: v for k, v in doc.metadata.items() if v is not None and v != ""}
+            echanges_docs.extend(loaded_echanges)
+
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement des documents d'échanges depuis {ECHANGES_PATH}: {e}", exc_info=True)
+    else:
+        logger.warning(f"Répertoire des échanges non trouvé: {ECHANGES_PATH}")
+
+    logger.info(f"Chargement complet: {len(official_docs)} officiels, {len(echanges_docs)} échanges, {len(rules_docs)} règles.")
+    return official_docs, echanges_docs, rules_docs
+
+# --- Fonctions de gestion du cache et des Vector Stores ---
+
 def calculate_documents_hash(documents: List[Document], embeddings: Embeddings) -> str:
-    """Calcule un hash unique pour l'ensemble des documents et le modèle d'embedding."""
-    content = str(type(embeddings).__name__)
-    if hasattr(embeddings, "model"): # Pour OpenAIEmbeddings
-         content += str(embeddings.model)
+    """Calcule un hash SHA256 basé sur le contenu des documents et le type/modèle d'embeddings."""
+    hasher = hashlib.sha256()
+
+    # Inclure des informations sur le modèle d'embedding
+    hasher.update(str(type(embeddings).__name__).encode('utf-8'))
+    if hasattr(embeddings, "model"): # Pour OpenAIEmbeddings et certains autres
+         hasher.update(str(embeddings.model).encode('utf-8'))
     elif hasattr(embeddings, "model_name"): # Pour MistralAIEmbeddings
-         content += str(embeddings.model_name)
-    
-    # Trier les documents pour assurer la consistance du hash
-    # Utiliser la page_content et les métadonnées pour le tri
-    sorted_docs = sorted(documents, key=lambda x: (x.page_content, str(sorted(x.metadata.items()))))
-    
+         hasher.update(str(embeddings.model_name).encode('utf-8'))
+
+    # Trier les documents par contenu et métadonnées pour un hash cohérent
+    # Convertir les métadonnées en une chaîne triée par clé pour la stabilité
+    sorted_docs = sorted(documents, key=lambda d: (d.page_content, str(sorted(d.metadata.items()))))
+
+    # Ajouter le contenu et les métadonnées triées de chaque document au hash
     for doc in sorted_docs:
-        content += doc.page_content
-        if doc.metadata:
-            content += str(sorted(doc.metadata.items()))
-    
-    return hashlib.sha256(content.encode('utf-8')).hexdigest() # Utiliser utf-8 pour l'encodage
+        hasher.update(doc.page_content.encode('utf-8'))
+        hasher.update(str(sorted(doc.metadata.items())).encode('utf-8'))
+
+    return hasher.hexdigest()
 
 def load_cached_embeddings_from_dir(embeddings: Embeddings, cache_dir: str, current_hash: str) -> Optional[VectorStore]:
-    """Charge les embeddings depuis un répertoire de cache spécifique si le hash correspond."""
-    os.makedirs(cache_dir, exist_ok=True)
-    
+    """Tente de charger un index FAISS depuis un cache si le hash correspond."""
+    os.makedirs(cache_dir, exist_ok=True) # S'assurer que le dossier cache existe
     hash_file_path = os.path.join(cache_dir, "documents_hash.txt")
-    faiss_index_path = os.path.join(cache_dir, "faiss_index")
-    
-    if os.path.exists(hash_file_path) and os.path.exists(faiss_index_path):
-        with open(hash_file_path, "r") as f:
-            cached_hash = f.read().strip()
-            
-        if cached_hash == current_hash:
-            try:
-                # IMPORTANT: allow_dangerous_deserialization est nécessaire pour charger des indices FAISS créés avec des versions plus anciennes de libraries
-                vector_store = FAISS.load_local(faiss_index_path, embeddings, allow_dangerous_deserialization=True)
-                logger.info(f"Cache - Index FAISS chargé depuis {cache_dir} avec succès.")
+    faiss_index_path = os.path.join(cache_dir, "faiss_index") # Dossier pour l'index FAISS
+
+    if os.path.exists(hash_file_path) and os.path.isdir(faiss_index_path):
+        try:
+            with open(hash_file_path, "r", encoding='utf-8') as f:
+                cached_hash = f.read().strip()
+
+            if cached_hash == current_hash:
+                logger.info(f"Cache HIT: Hash correspondant trouvé dans {cache_dir}. Chargement de l'index FAISS...")
+                # allow_dangerous_deserialization est nécessaire pour FAISS
+                vector_store = FAISS.load_local(
+                    faiss_index_path,
+                    embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                logger.info(f"Cache - Index FAISS chargé avec succès depuis {cache_dir}.")
                 return vector_store
-            except Exception as e:
-                logger.error(f"Cache - Erreur lors du chargement de l'index FAISS depuis {cache_dir}: {e}")
-    
-    return None
-
-def identify_relevant_rules(question: str, rules_vector_store: VectorStore) -> List[Document]:
-    """Identifie les règles pertinentes pour une question donnée en utilisant la recherche top-k."""
-    try:
-        if rules_vector_store is None:
-            logger.warning("Rules vector store non initialisé. Impossible d'identifier les règles pertinentes.")
-            return []
-
-        # Utilisation de la recherche par similarité (Top-K)
-        max_rules = 5  # On cherche les 5 règles les plus similaires
+            else:
+                logger.info(f"Cache MISS: Hash différent dans {cache_dir}. Recalcul nécessaire.")
+        except FileNotFoundError:
+             logger.warning(f"Cache - Fichier hash ou dossier index non trouvé dans {cache_dir} (peut être normal lors du premier lancement).")
+        except Exception as e:
+            logger.error(f"Cache - Erreur lors du chargement de l'index FAISS depuis {cache_dir}: {e}", exc_info=True)
         
-        relevant_rules = rules_vector_store.similarity_search(question, k=max_rules)
-        
-        logger.info(f"{len(relevant_rules)} règles potentiellement pertinentes identifiées (top {max_rules}).")
-        
-        # On s'assure que chaque document a bien la catégorie 'regles' et le type 'rule_document'
-        for rule in relevant_rules:
-             rule.metadata['category'] = 'regles'
-             rule.metadata['type'] = 'rule_document'
-             
-        return relevant_rules
-    except Exception as e:
-        logger.error(f"Erreur lors de l'identification des règles pertinentes: {e}", exc_info=True)
-        return []
-    
-    
+    else:
+        logger.info(f"Cache - Cache non trouvé ou incomplet dans {cache_dir}.")
 
-
-def load_cached_embeddings(documents: List[Document], embeddings: Embeddings) -> Tuple[Optional[VectorStore], str]:
-    """Charge les embeddings depuis le cache s'ils existent et sont valides."""
-    # Créer le répertoire de cache s'il n'existe pas
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    
-    # Calculer le hash des documents courants et du modèle d'embedding
-    current_hash = calculate_documents_hash(documents, embeddings)
-    hash_file_path = os.path.join(CACHE_DIR, "documents_hash.txt")
-    faiss_index_path = os.path.join(CACHE_DIR, "faiss_index")
-    
-    # Vérifier si le cache est valide
-    if os.path.exists(hash_file_path) and os.path.exists(faiss_index_path):
-        with open(hash_file_path, "r") as f:
-            cached_hash = f.read().strip()
-            
-        # Si le hash correspond, charger l'index FAISS
-        if cached_hash == current_hash:
-            try:
-                vector_store = FAISS.load_local(faiss_index_path, embeddings, allow_dangerous_deserialization=True)
-                logger.info("Index FAISS chargé depuis le cache avec succès")
-                return vector_store, current_hash
-            except Exception as e:
-                logger.error(f"Erreur lors du chargement de l'index FAISS: {e}")
-    
-    return None, current_hash
+    return None # Retourner None si le cache n'est pas valide ou n'existe pas
 
 def save_embeddings_cache_to_dir(vector_store: VectorStore, documents_hash: str, cache_dir: str):
-    """Sauvegarde les embeddings et le hash des documents dans un répertoire de cache spécifique."""
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # Sauvegarder le hash des documents
-    hash_file_path = os.path.join(cache_dir, "documents_hash.txt")
-    with open(hash_file_path, "w") as f:
-        f.write(documents_hash)
-    
-    # Sauvegarder l'index FAISS
-    faiss_index_path = os.path.join(cache_dir, "faiss_index")
-    vector_store.save_local(faiss_index_path)
-    logger.info(f"Cache - Embeddings sauvegardés dans {cache_dir}.")
+    """Sauvegarde l'index FAISS et le hash des documents dans un répertoire de cache."""
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        hash_file_path = os.path.join(cache_dir, "documents_hash.txt")
+        faiss_index_path = os.path.join(cache_dir, "faiss_index")
 
+        # Sauvegarder l'index FAISS
+        vector_store.save_local(faiss_index_path)
 
+        # Sauvegarder le hash (seulement après la sauvegarde réussie de l'index)
+        with open(hash_file_path, "w", encoding='utf-8') as f:
+            f.write(documents_hash)
+        logger.info(f"Cache - Embeddings et hash sauvegardés avec succès dans {cache_dir}.")
+
+    except Exception as e:
+         logger.error(f"Cache - Erreur critique lors de la sauvegarde du cache dans {cache_dir}: {e}", exc_info=True)
 
 def create_vector_store(documents: List[Document], embeddings: Embeddings, cache_dir: str) -> Optional[VectorStore]:
-    """Crée un vectorstore optimisé avec cache pour les embeddings dans un répertoire spécifique."""
-    
-    # Si la liste de documents est vide, on ne peut pas créer de vector store
+    """Crée ou charge un vector store FAISS depuis le cache."""
+
     if not documents:
-        logger.warning(f"Cache - Aucuns documents fournis pour créer le vector store dans {cache_dir}.")
+        logger.warning(f"Aucun document fourni pour le vector store dans {cache_dir}. Création annulée.")
         return None
-        
+    if embeddings is None:
+        logger.error(f"Modèle d'embeddings non fourni pour {cache_dir}. Création annulée.")
+        return None
+
+    logger.info(f"Préparation du vector store pour {cache_dir} ({len(documents)} documents)...")
+    # 1. Calculer le hash actuel
     current_hash = calculate_documents_hash(documents, embeddings)
-    
-    # Essayer de charger depuis le cache
+
+    # 2. Essayer de charger depuis le cache
     vector_store = load_cached_embeddings_from_dir(embeddings, cache_dir, current_hash)
-    
-    # Si le cache est valide, utiliser le vectorstore chargé
+
+    # 3. Si le cache est trouvé et valide, le retourner
     if vector_store is not None:
-        logger.info(f"Cache - Utilisation des embeddings en cache depuis {cache_dir}.")
         return vector_store
-    
-    # Sinon, créer un nouveau vectorstore
-    logger.info(f"Cache - Calcul des nouveaux embeddings pour {cache_dir}...")
+
+    # 4. Sinon, créer un nouveau vector store
+    logger.info(f"Création d'un nouvel index FAISS pour {cache_dir}...")
     try:
         vector_store = FAISS.from_documents(documents, embeddings)
-        # Sauvegarder les embeddings et le hash des documents dans le cache
+        logger.info(f"Nouvel index FAISS créé pour {cache_dir}. Sauvegarde en cache...")
+        # 5. Sauvegarder le nouveau store dans le cache
         save_embeddings_cache_to_dir(vector_store, current_hash, cache_dir)
         return vector_store
     except Exception as e:
-        logger.error(f"Cache - Erreur lors de la création de l'index FAISS pour {cache_dir}: {e}", exc_info=True)
-        return None
+        logger.error(f"Erreur critique lors de la création de l'index FAISS pour {cache_dir}: {e}", exc_info=True)
+        return None # Échec de la création
 
-# ================= EXTRACTION ET TRAITEMENT DES DONNÉES =================
+
+# ================= EXTRACTION ET TRAITEMENT DES DONNÉES (pour le graphe) =================
 
 def extract_dossier_number(question: str) -> List[str]:
-    """Extrait les numéros de dossier de la question."""
-    patterns = [
-        r'\b\d{2}-\d{4}\b',  # Format 82-2069
-        r'\bdossier\s+(?:n°|numéro|numero|n|°|)?\s*(\w+-\w+)\b',  # Format avec "dossier n° XXX-XXX"
-        r'\bdossier\s+(?:n°|numéro|numero|n|°|)?\s*(\d+)\b'  # Format avec "dossier n° XXX"
-    ]
-    
+    """
+    Extrait les numéros de dossier (formats XX-XX, XX-XXX, XX-XXXX avec
+    séparateur '-' ou ' ') de la question. Normalise au format XX-YY[YY].
+    """
+    pattern = r'\b(\d{2}[-\s]\d{2,4})\b'
+
+    # Trouver toutes les correspondances non chevauchantes, insensible à la casse
+    matches = re.findall(pattern, question, re.IGNORECASE)
+
     results = []
-    for pattern in patterns:
-        matches = re.findall(pattern, question, re.IGNORECASE)
-        if matches:
-            results.extend(matches)
-    
-    return list(set(results))  # Éliminer les doublons
+    seen = set() # Utiliser un set pour une déduplication efficace
+    for match in matches:
+        # Normaliser le séparateur en tiret
+        normalized_match = re.sub(r'\s', '-', match).strip()
+        # Ajouter à la liste si ce n'est pas un doublon
+        if normalized_match not in seen:
+            results.append(normalized_match)
+            seen.add(normalized_match)
+
+    if results:
+         # Utiliser logger.info si logger est disponible et configuré
+         try:
+             logger.info(f"Numéros de dossier potentiels extraits de la question: {results}")
+         except NameError: # Gérer le cas où logger n'est pas défini globalement
+             print(f"INFO: Numéros de dossier potentiels extraits de la question: {results}") 
+    else:
+         try:
+            logger.debug(f"Aucun numéro de dossier correspondant aux formats (XX-XX[XX]) trouvé dans: '{question[:100]}...'")
+         except NameError:
+            pass # Ne rien afficher si aucun numéro trouvé et pas de logger
+
+    return results
 
 def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]:
-    """Convertit les résultats de la base de données en documents Langchain."""
-    documents = [] 
-    for resultat in resultats:
-        # Contenu formaté à partir des données du dossier
-        content = f"""
-        - Informations sur le dossier {resultat.get('Numero', 'N/A')}:
-        - Nom de l'usager: {resultat.get('nom_usager', 'N/A')}
-        - Date de création: {resultat.get('date_creation', 'N/A')}
-        - Dernière modification: {resultat.get('derniere_modification', 'N/A')}
-        - Agent affecté: {resultat.get('agent_affecter', 'N/A')}
-        - Instructeur: {resultat.get('instructeur', 'N/A')}
-        - Statut actuel: {resultat.get('statut', 'N/A')}
-        - Statut visible par l'usager: {resultat.get('statut_visible_usager', 'N/A')}
-        - Montant: {resultat.get('montant', 'N/A')} €
-        """
-        
-        # Création d'un document Langchain avec les métadonnées
-        doc = Document(
-            page_content=content.strip(),
-            metadata={
-                "source": "base_de_donnees",
-                "type": "dossier",
-                "numéro": resultat.get('Numero', 'N/A'),
-                "section": "Informations dossier",
-                "page": "", 
-                "update_date": resultat.get('derniere_modification', 'N/A')
-            }
-        )
-        
+    """Convertit les résultats de la base de données (liste de dictionnaires) en Documents Langchain."""
+    documents = []
+    if not resultats:
+        return documents
+
+    logger.info(f"Conversion de {len(resultats)} résultat(s) BDD en Documents Langchain.")
+    for i, resultat in enumerate(resultats):
+        # Formatage du contenu pour lisibilité
+        content_parts = [f"**Informations Dossier BDD {resultat.get('Numero', 'N/A')} (Résultat {i+1})**"]
+        for key, value in resultat.items():
+             # Formate les dates si présentes
+             if isinstance(value, date):
+                 value_str = value.strftime('%d/%m/%Y')
+             else:
+                 value_str = str(value) if value is not None else 'N/A'
+             # Formater la ligne (ex: Nom Usager: Dupont)
+             formatted_key = key.replace('_', ' ').capitalize()
+             content_parts.append(f"- {formatted_key}: {value_str}")
+
+        content = "\n".join(content_parts)
+
+        # Création des métadonnées spécifiques à la BDD
+        metadata = {
+            "source": "base_de_donnees",
+            "category": "dossier_bdd", # Catégorie claire
+            "type": "db_data",       # Type clair
+            "numero_dossier": resultat.get('Numero', 'N/A'),
+            "db_result_index": i + 1, # Index du résultat dans la liste BDD
+            "update_date": resultat.get('derniere_modification', None) # Date objet si possible
+        }
+        metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+
+        doc = Document(page_content=content.strip(), metadata=metadata)
         documents.append(doc)
-        
+
     return documents
+
 
 # ================= FONCTIONS DU GRAPHE RAG =================
 
-# --- search_database --------------------
 def search_database(state: State) -> Dict[str, Any]:
-    """Extrait les numéros de dossier de la question et interroge la DB."""
-    dossier_numbers = extract_dossier_number(state["question"])
-    logger.info(f"Numéros extraits: {dossier_numbers}")
+    """Noeud du graphe: Recherche dans la BDD basé sur les numéros extraits."""
+    global db_manager, db_connected
+    logger.info("Noeud: search_database")
+
+    question = state["question"]
+    dossier_numbers = extract_dossier_number(question)
 
     db_results = []
+    if not db_connected or not db_manager:
+        logger.warning("Recherche BDD annulée: connexion non disponible ou manager non initialisé.")
+        return {"db_results": []}
+
     if dossier_numbers:
+        # Stratégie actuelle: rechercher le premier numéro trouvé.
+        num_to_search = dossier_numbers[0]
+        logger.info(f"Tentative de recherche BDD pour le numéro: {num_to_search}")
         try:
-            db_manager = DatabaseManager()
-            if db_manager.tester_connexion():
-                for num in dossier_numbers:
-                    db_results.extend(db_manager.rechercher_dossier(numero_dossier=num))
-                logger.info(f"{len(db_results)} résultats DB.")
+            db_results = db_manager.rechercher_dossier(numero_dossier=num_to_search)
+            logger.info(f"{len(db_results)} résultats BDD trouvés pour {num_to_search}.")
         except Exception as e:
-            logger.error(f"Recherche DB – erreur: {e}", exc_info=True)
+            logger.error(f"Erreur pendant l'appel à rechercher_dossier: {e}", exc_info=True)
+            db_results = [] # Assurer une liste vide en cas d'erreur
+    else:
+         logger.info("Aucun numéro de dossier détecté dans la question pour la recherche BDD.")
 
     return {"db_results": db_results}
 
-
 def retrieve(state: State) -> Dict[str, Any]:
-    """Récupère les documents pertinents basés sur la question, en priorisant les règles."""
-    global knowledge_vector_store, rules_vector_store
-    
-    logger.info("Début de l'étape de Récuperation.")
-    
-    try:
-        # Initialisation du contexte
-        context_docs_from_vectors = [] # Pour stocker les documents des vector stores
-        
-        
-        # Étape 1: Identifier les règles pertinentes d'abord
-        if rules_vector_store is not None:
-            relevant_rules = identify_relevant_rules(state["question"], rules_vector_store)
-            
-            # Ajouter les règles au contexte provenant des vectorstores
-            context_docs_from_vectors.extend(relevant_rules)
-            
-            logger.info(f"Récuperation - {len(relevant_rules)} règles pertinentes identifiées et ajoutées au contexte Vector Store.")
-        else:
-            logger.warning("Récuperation - Le vector store des règles n'est pas initialisé")
-        
-        # Étape 2: Récupérer les documents généraux pertinents (docs officiels, échanges)
-        if knowledge_vector_store is not None:
-            retrieved_knowledge_docs = knowledge_vector_store.similarity_search(state["question"], k=7)
-            
-            # Ajouter les documents de connaissance au contexte provenant des vector stores
-            context_docs_from_vectors.extend(retrieved_knowledge_docs)
-            
-            logger.info(f"Récuperation - {len(retrieved_knowledge_docs)} documents de connaissances récupérés et ajoutés au contexte Vector Store.")
-        else:
-            logger.error("Récuperation - Le vector store de connaissances n'est pas initialisé")
-            
-        # Étape 3: Convertir les résultats de la base de données en documents
-        db_docs = db_resultats_to_documents(state["db_results"])
-        
-        logger.info(f"Récuperation - {len(db_docs)} documents créés à partir des résultats de la base de données.")
-        
-        # Étape 4: Combiner les documents, en plaçant les règles et données BDD en tête dans la liste du contexte passée à generate.
-        combined_docs = db_docs + context_docs_from_vectors
-        
-        # S'assurer que tous les documents ont un type et une catégorie pour la génération
-        for doc in combined_docs:
-            if "type" not in doc.metadata:
-                 doc.metadata["type"] = "Document inconnue" 
-            if "category" not in doc.metadata:
-                 doc.metadata["category"] = "Categorie inconnue"
-                 
-        logger.info(f"Récuperation - Total de {len(combined_docs)} documents dans le contexte combiné.")
-        
-        return {"context": combined_docs}
-    except Exception as e:
-        logger.error(f"Récuperation - Erreur dans la fonction retrieve: {e}", exc_info=True)
-        
-        #On Retourne un contexte vide en cas d'erreur pour ne pas bloquer le graphe,
-        # la fonction generate gérera le cas du contexte vide.
-        return {"context": []}
+    """Noeud du graphe: Récupère les documents depuis BDD et les 3 vector stores."""
+    global rules_vector_store, official_docs_vector_store, echanges_vector_store
+    logger.info("Noeud: retrieve")
+
+    question = state["question"]
+    # 1. Convertir les résultats BDD (déjà dans l'état) en Documents
+    db_docs = db_resultats_to_documents(state.get("db_results", []))
+
+    # Initialiser les listes de résultats des recherches vectorielles
+    relevant_rules = []
+    relevant_official_docs = []
+    relevant_echanges = []
+
+    # 2. Interroger le Vector Store des Règles (k faible, haute pertinence attendue)
+    if rules_vector_store:
+        try:
+            logger.debug(f"Recherche Règles pour: '{question[:50]}...'")
+            relevant_rules = rules_vector_store.similarity_search(question, k=3)
+            logger.info(f"Retrieve - {len(relevant_rules)} règles récupérées.")
+           
+        except Exception as e:
+            logger.error(f"Retrieve - Erreur recherche rules_vector_store: {e}", exc_info=True)
+    else:
+        logger.warning("Retrieve - rules_vector_store non disponible.")
+
+    # 3. Interroger le Vector Store des Documents Officiels (k moyen, base de connaissance)
+    if official_docs_vector_store:
+        try:
+            logger.debug(f"Recherche Docs Officiels pour: '{question[:50]}...'")
+            relevant_official_docs = official_docs_vector_store.similarity_search(question, k=5)
+            logger.info(f"Retrieve - {len(relevant_official_docs)} documents officiels récupérés.")
+        except Exception as e:
+            logger.error(f"Retrieve - Erreur recherche official_docs_vector_store: {e}", exc_info=True)
+    else:
+        logger.warning("Retrieve - official_docs_vector_store non disponible.")
+
+    # 4. Interroger le Vector Store des Échanges (k faible/moyen, pour style/exemples)
+    if echanges_vector_store:
+        try:
+            logger.debug(f"Recherche Echanges pour: '{question[:50]}...'")
+            relevant_echanges = echanges_vector_store.similarity_search(question, k=3)
+            logger.info(f"Retrieve - {len(relevant_echanges)} documents d'échanges récupérés.")
+        except Exception as e:
+            logger.error(f"Retrieve - Erreur recherche echanges_vector_store: {e}", exc_info=True)
+    else:
+        logger.warning("Retrieve - echanges_vector_store non disponible.")
+
+    # 5. Combiner les résultats dans l'ordre de priorité pour le LLM: BDD > Règles > Officiels > Échanges
+    combined_docs = db_docs + relevant_rules + relevant_official_docs + relevant_echanges
+    logger.info(f"Retrieve - Documents combinés avant déduplication: {len(combined_docs)} "
+                f"(BDD: {len(db_docs)}, Règles: {len(relevant_rules)}, "
+                f"Officiels: {len(relevant_official_docs)}, Echanges: {len(relevant_echanges)})")
+
+    # 6. Déduplication simple basée sur le contenu exact 
+    seen_content = set()
+    unique_docs = []
+    for doc in combined_docs:
+        # Clé de déduplication: contenu + source principale (pour différencier légèrement)
+        dedup_key = (doc.page_content, doc.metadata.get("source_file", doc.metadata.get("source")))
+        if dedup_key not in seen_content:
+            unique_docs.append(doc)
+            seen_content.add(dedup_key)
+
+    if len(unique_docs) < len(combined_docs):
+         logger.info(f"Retrieve - Documents après déduplication: {len(unique_docs)}")
+
+    return {"context": unique_docs}
 
 def generate(state: State) -> Dict[str, Any]:
-    """Génère une réponse basée sur la question et le contexte, avec un prompt amélioré."""
+    """Noeud du graphe: Génère la réponse en utilisant le LLM, le contexte et un prompt structuré."""
     global llm
-    
-    logger.info("Début de l'étape la géneration de réponse .")
+    logger.info("Noeud: generate")
+
+    question = state["question"]
+    context_docs = state.get("context", [])
+
+    if llm is None:
+        logger.error("Génération impossible: Le modèle LLM n'est pas initialisé.")
+        return {"answer": "Erreur: Le service de génération de réponse n'est pas disponible."}
+
+    if not context_docs:
+        logger.warning("Génération: Aucun document de contexte fourni après l'étape retrieve.")
+        # Vérifier si la BDD avait des résultats même si le reste est vide
+        db_results_in_state = state.get("db_results", [])
+        if db_results_in_state:
+             db_docs_only = db_resultats_to_documents(db_results_in_state)
+             db_content_only = "\n\n".join([doc.page_content for doc in db_docs_only])
+             answer_only_db = (f"J'ai trouvé les informations suivantes dans la base de données concernant votre demande :\n\n{db_content_only}\n\n"
+                               "Cependant, je n'ai pas trouvé d'informations complémentaires ou de règles spécifiques dans ma base de connaissances pour élaborer davantage.")
+             return {"answer": answer_only_db}
+        else:
+            return {"answer": "Je suis désolé, mais je n'ai trouvé aucune information pertinente (ni dans la base de données, ni dans les documents de référence) pour répondre à votre question."}
+
+    # Préparer le contexte structuré pour le prompt
+    rules_content, db_content, official_content, echanges_content, other_content = [], [], [], [], []
+    docs_details_list = []
+    source_counter = 1
+
+    for doc in context_docs:
+        category = doc.metadata.get("category", "inconnu")
+        doc_type = doc.metadata.get("type", "inconnu")
+        source_file = doc.metadata.get("source_file", os.path.basename(doc.metadata.get("source", "Source inconnue")))
+        source_id = f"SOURCE {source_counter}"
+        content_with_id = f"[{source_id}]\n{doc.page_content.strip()}"
+
+        doc_info = {
+            "id": source_id,
+            "file": source_file,
+            "category": category,
+            "type": doc_type,
+        }
+        docs_details_list.append(doc_info)
+
+        # Classifier pour le prompt basé sur la catégorie/type
+        if category == "regles" or doc_type == "rule_document":
+            rules_content.append(content_with_id)
+        elif category == "dossier_bdd" or doc_type == "db_data":
+            db_content.append(content_with_id)
+        elif category == "docs_officiels" or doc_type == "knowledge_document":
+            official_content.append(content_with_id)
+        elif category == "echanges" or doc_type == "echange_document":
+            echanges_content.append(content_with_id)
+        else:
+            other_content.append(f"[{source_id} - Catégorie: {category}]\n{doc.page_content.strip()}") # Préciser la catégorie si inconnue
+
+        source_counter += 1
+
+    # Construire les sections du contexte pour le prompt
+    context_sections = []
+    if db_content: context_sections.append("**INFORMATIONS SPÉCIFIQUES AU DOSSIER (Base de Données - Priorité 1 - Absolue):**\n" + "\n\n---\n\n".join(db_content))
+    if rules_content: context_sections.append("**RÈGLES APPLICABLES (Priorité 2 - Très Haute):**\n" + "\n\n---\n\n".join(rules_content))
+    if official_content: context_sections.append("**DOCUMENTS OFFICIELS / PROCÉDURES (Priorité 3 - Standard):**\n" + "\n\n---\n\n".join(official_content))
+    if echanges_content: context_sections.append("**EXEMPLES D'ÉCHANGES (Utiliser pour style/ton SEULEMENT - Priorité 4 - Basse):**\n" + "\n\n---\n\n".join(echanges_content))
+    if other_content: context_sections.append("**AUTRES DOCUMENTS (Vérifier pertinence - Priorité 5 - Très Basse):**\n" + "\n\n---\n\n".join(other_content))
+
+    context_string_for_prompt = "\n\n".join(context_sections)
+
+    # Formater la liste des sources pour référence
+    formatted_sources_list = "\n".join([f"- [{d['id']}] {d['file']} (Cat: {d['category']}, Type: {d['type']})" for d in docs_details_list])
+
+    # Instructions Système 
+    system_instructions = (
+        "Tu es un assistant expert spécialisé dans le dispositif KAP Numérique, conçu pour aider les agents instructeurs.\n"
+        "Ta mission est de fournir des réponses précises, structurées et professionnelles basées **exclusivement** sur les informations fournies dans le contexte.\n\n"
+        "**RÈGLES IMPÉRATIVES POUR LA GÉNÉRATION DE RÉPONSE:**\n"
+        "1.  **HIÉRARCHIE STRICTE DES SOURCES:** Analyse le contexte en respectant l'ordre de priorité suivant:\n"
+        "    1.  Base de Données (`dossier_bdd`, `db_data`): **Priorité absolue**. Fais confiance à ces données pour les informations spécifiques au dossier.\n"
+        "    2.  Règles (`regles`, `rule_document`): **Priorité très haute**. Applique ces directives internes.\n"
+        "    3.  Documents Officiels (`docs_officiels`, `knowledge_document`): **Priorité standard**. Utilise pour les procédures générales et faits.\n"
+        "    4.  Échanges (`echanges`, `echange_document`): **Priorité basse**. Utilise **UNIQUEMENT** comme inspiration pour le ton et la formulation. **NE JAMAIS** citer comme source factuelle si cela contredit les sources 1, 2 ou 3.\n"
+        "    5.  Autres documents: **Priorité très basse**. Utilise avec extrême prudence, si et seulement si aucune autre source ne répond.\n"
+        "2.  **EXCLUSIVITÉ DU CONTEXTE:** Base **toute** ta réponse sur les informations présentes dans le contexte fourni (`[SOURCE X]`). N'ajoute aucune information externe, même si tu penses la connaître.\n"
+        "3.  **MANQUE D'INFORMATION:** Si l'information nécessaire pour répondre n'est pas dans le contexte, indique-le clairement (ex: \"Le contexte fourni ne contient pas d'information sur [sujet].\"). **NE JAMAIS INVENTER.**\n"
+        "4.  **FORMAT ET STYLE:**\n"
+        "    - Adresse-toi à l'agent instructeur.\n"
+        "    - Style: Formel, institutionnel, clair, concis.\n"
+        "    - Formatage Markdown: Utilise **gras**, *italique*, listes à puces/numérotées, `### Titres` pour structurer.\n"
+        "    - Citations: Justifie les points clés en citant la source exacte `[SOURCE X]`. Si multiple: `[SOURCE 1, SOURCE 3]`.\n"
+        "5.  **INTERDICTIONS:**\n"
+        "    - Ne mentionne jamais que tu es une IA ou un chatbot.\n"
+        "    - N'invite pas à contacter un autre agent.\n"
+        "    - N'utilise pas les échanges comme source factuelle.\n\n"
+        "**Processus:**\n"
+        "1. Lire attentivement la question de l'agent.\n"
+        "2. Analyser le contexte fourni en respectant la hiérarchie des sources.\n"
+        "3. Formuler une réponse directe à la question.\n"
+        "4. Détailler et justifier avec les sources `[SOURCE X]`.\n"
+        "5. Utiliser le formatage Markdown pour la clarté.\n"
+        "6. Si l'information manque, le signaler."
+    )
+
+    # Construction de l'invite utilisateur
+    user_prompt = (
+        f"**Question de l'Agent Instructeur:**\n{question}\n\n"
+        f"**Contexte Fourni (analyser en respectant la hiérarchie indiquée dans les instructions système):**\n"
+        f"---\n{context_string_for_prompt}\n---\n\n"
+        f"**Liste des Sources du Contexte:**\n{formatted_sources_list}\n\n"
+        f"**Réponse pour l'Agent (basée EXCLUSIVEMENT sur le contexte, justifiée avec [SOURCE X], format Markdown):**"
+    )
+
+    logger.info(f"Génération - Prompt final préparé (longueur approx: {len(user_prompt)} chars). Appel du LLM...")
+
+    # Appel du modèle LLM
     try:
-        # Étape 0: Vérifier si le modèle LLM est initialisé
-        if llm is None:
-            logger.error("Le modèle LLM n'est pas initialisé")
-            return {"answer": "Le système n'est pas correctement initialisé (LLM manquant). Veuillez contacter l'administrateur."}
-        
-        # Étape 1: Séparer les documents par type pour la structure du prompt
-        rules_docs = []
-        db_docs = []
-        knowledge_docs = []
-        docs_details = []
-        
-        
-        for doc in state["context"]:
-            doc_type = doc.metadata.get("type")
-            category = doc.metadata.get("category", "non classifié")
-            source = doc.metadata.get("source", "Source inconnue")
-            if doc_type in ("db_data", "dossier") or source == "base_de_donnees":
-                db_docs.append(doc)
-            
-            # Classification des documents
-            if doc_type == "rule_document" or category == "regles":
-                    rules_docs.append(doc)
-            elif doc_type == "db_data" or source == "base_de_donnees":
-                    db_docs.append(doc)
-            else: # docs_officiels, echanges, ou non classifié
-                    knowledge_docs.append(doc)
-                    
-            # Préparation des détails pour le formatage des sources
-            if source == "base_de_donnees":
-                file_name = f"Base de données - Dossier {doc.metadata.get('numéro', 'inconnu')}"
-                section = doc.metadata.get("section", "Section non spécifiée")
-                page = "N/A"
-                update_date = doc.metadata.get("update_date", "Date non disponible")
-            else:
-                file_name = os.path.basename(source)
-                section = doc.metadata.get("section", "Section non spécifiée")
-                page = doc.metadata.get("page", "Page non spécifiée")
-                update_date = doc.metadata.get("update_date", "Date non disponible")
+        messages = [
+            {"role": "system", "content": system_instructions},
+            {"role": "user", "content": user_prompt}
+        ]
+        response = llm.invoke(
+            messages,
+            # Options de génération de réponse
+             temperature=0.1,
+             max_tokens=2000
+            )
+        final_answer = response.content
+        logger.info("Génération - Réponse reçue du LLM.")
+        return {"answer": final_answer}
 
-            docs_details.append({
-                "content": doc.page_content,
-                "file_name": file_name,
-                "section": section,
-                "page": page,
-                "update_date": update_date,
-                "category": category,
-                "type": doc_type # type pour reference
-            })
-        
-        # Étape 2: Formater les règles spécifiques (si présentes)
-        rules_content = ""
-        if rules_docs:
-            rules_content = "RÈGLES APPLICABLES À CETTE SITUATION:\n"
-            for i, rule in enumerate(rules_docs, 1):
-                # Utiliser directement le page_content qui est déjà formaté par load_rules_from_json
-                rules_content += f"{rule.page_content.strip()}\n\n"
-                title = rule.metadata.get("title", "Sans titre")
-                #rules_content += f"RÈGLE {rule_num}: {title}\n{rule.page_content}\n\n"
-                logger.info(f"generation - Ajout de {len(rules_docs)} règles au prompt.")
-        
-        # Étape 3: Formater les données de la base de données
-        db_content = ""
-        if db_docs:
-            db_content = "INFORMATIONS DU DOSSIER DANS LA BASE DE DONNÉES:\n"
-            for doc in db_docs:
-                db_content += f"{doc.page_content.strip()}\n\n"
-                logger.info(f"Génération - Ajout de {len(db_docs)} documents BDD au prompt.")
-        
-        # Étape 4: Formater les autres connaissances
-        knowledge_content = ""
-        if knowledge_docs:
-            knowledge_content = "INFORMATIONS COMPLÉMENTAIRES:\n"
-            for doc in knowledge_docs:
-                source = doc.metadata.get("source", "Source inconnue")
-                category = doc.metadata.get("category", "non classifié")
-                knowledge_content += f"[{category.upper()} - {os.path.basename(source)}]\n{doc.page_content}\n\n"
-                knowledge_content += f"{doc.page_content.strip()}\n\n"
-            logger.info(f"Génération - Ajout de {len(knowledge_docs)} documents de connaissances au prompt.")
-        
-        # Étape 5: Formater les sources pour référence
-        # On liste toutes les sources utilisées dans le contexte combiné
-        formatted_sources = "\n".join([
-            f"[SOURCE: {doc['file_name']} | Catégorie: {doc['category']} | Type: {doc['type']} | Section: {doc['section']} | Page: {doc['page']} | Mise à jour: {doc['update_date']}]"
-            for doc in docs_details
-        ])
-        
-        # Si aucun contexte n'a été trouvé du tout
-        if not rules_content and not db_content and not knowledge_content:
-             logger.warning("Génération - Aucun document de contexte fourni à la fonction generate.")
-             return {"answer": "Je n'ai pas trouvé d'informations pertinentes (règles, données de dossier, ou documents de connaissance) pour répondre à votre question."}
-
-        
-        
-        
-        # Étape 6: Instructions système améliorées
-        system_instructions = (
-            "Tu es un instructeur expert du dispositif KAP Numérique qui répond aux questions des agents instructeurs. "
-            "IMPORTANT: TOUJOURS APPLIQUER EN PRIORITÉ LES RÈGLES FOURNIES CI-DESSOUS. "
-            "Les règles ont une priorité absolue sur toutes les autres sources. Ne jamais répondre sans appliquer les règles pertinentes si nécéssaire.\n\n"
-            
-            "RÈGLES DE TRAITEMENT DES SOURCES:\n"
-            "1. Documents 'regles': Applique-les comme directives internes prioritaires pour toute décision ou interprétation. Ces règles sont prioritaires et doivent être strictement suivies.\n"
-            "- Si aucune règle pertinente n'est trouvée dans, passe à la source suivante.\n"
-            
-            "2. **PRIORITÉ ÉLEVÉE AUX DONNÉES DE LA BASE DE DONNÉES :**: Ces informations sont les plus à jour et ont priorité sur les documents officiels.\n"
-            "- Si une règle s'applique à des données BDD, utilise les données BDD en respectant la règle.\n"
-            
-            "3. Documents 'docs_officiels': Utilise-les comme source pour les informations factuelles et procédures officielles.\n"
-            "- Les documents 'docs_officiels' sont fiables pour les procédures et informations factuelles générales.\n"
-            
-            "4. Documents 'echanges': Utilise-les UNIQUEMENT comme modèles de formulation et de ton professionnel, JAMAIS comme source d'information factuelle, contredisant des règles, BDD, ou docs officiels.\n\n"
-
-            "FORMAT DE RÉPONSE:\n"
-            "- Commence toujours par répondre directement à la question principale.\n"
-            "- Utilise un style rédactionnel formel, structuré et institutionnel.\n"
-            "- Rédige comme si la réponse était adressée directement au bénéficiaire.\n"
-            "- Pour les instructions ou étapes à suivre: utilise des listes numérotées clairement formatées.\n"
-            "- Pour les synthèses de dossier: Commence par un résumé de statut, puis détaille les éléments importants.\n\n"
-            
-            "STRUCTURE DE RÉPONSE:\n"
-            "1. Commence par une phrase d'accroche directe qui répond à la question principale.\n"
-            "2. Développe ensuite les détails pertinents en fonction de la priorité des informations.\n"
-            "3. Si nécessaire, indique les étapes ou procédures applicables.\n"
-            "4. Conclus par les actions recommandées ou les délais à respecter.\n"
-            
-            "Si tu ne trouves pas d'information pertinente dans le contexte fourni, indique clairement: \"Je ne dispose pas des informations nécessaires pour répondre précisément à cette question.\"\n"
-            
-            "CONSIGNES DE RÉDACTION:\n"
-            "- Adopte systématiquement un ton professionnel et institutionnel.\n"
-            "- Évite les formulations trop familières ou personnelles.\n"
-            "- Sois précis et factuel, sans ambiguïté.\n"
-            "- Respecte le vocabulaire technique spécifique au dispositif KAP Numérique.\n"
-            "- N'invente JAMAIS d'informations qui ne seraient pas présentes dans les sources.\n\n"
-            
-            "--- CONSIGNES À NE JAMAIS FAIRE --- \n"
-            "- N'invite JAMAIS à contacter un agent puisque c'est déjà un agent qui te consulte.\n"
-            "- NE JAMAIS inventer d'informations. Si l'information n'est pas dans les sources, indique-le clairement.\n"
-            "- Ne mentionne jamais que tu es une IA ou un chatbot dans ta réponse au bénéficiaire.\n"
-            
-            "Analyse la question, consulte le contexte en respectant scrupuleusement l'ordre de priorité indiqué par les balises, et génère la réponse la plus précise et conforme possible pour le bénéficiaire."
-           
-        )
-
-        
-        # Étape 7: Construire l'invite utilisateur structurée
-        user_prompt = (
-            f"QUESTION DE L'AGENT INSTRUCTEUR: {state['question']}\n\n"
-            f"{rules_content}\n"
-            "Veuillez appliquer les règles ci-dessus en priorité pour répondre à la question.\n\n"
-            f"{db_content}\n"
-           
-            f"{knowledge_content}\n\n"
-            "Rédige une réponse professionnelle que l'agent pourra transmettre directement au bénéficiaire.\n\n"
-            f"SOURCES DE RÉFÉRENCE:\n{formatted_sources}"
-        )
-        
-        logger.info(f"Génération - Prompt utilisateur construit. Longueur: {len(user_prompt)} caractères.")
-         
-        # Étape 8: Appeler le modèle LLM
-        try:
-            messages = [
-                {"role": "system", "content": system_instructions},
-                {"role": "user", "content": user_prompt}
-            ]
-            
-            # Configuration pour l'appel, ajuster temperature si besoin (0.0 pour plus de détermisme, >0 pour créativité)
-            # max_tokens peut être utile si les réponses sont trop longues ou coupées.
-            
-            response = llm.invoke(messages,temperature=0.1, max_tokens=1500)
-            
-            logger.info("Génération - Appel LLM réussi.")
-            
-            return {"answer": response.content}
-        
-        except Exception as e:
-            logger.error(f"Génération - Erreur lors de l'appel au LLM: {e}")
-            return {"answer": f"Erreur lors de la génération de la réponse : {e}"}
-        
     except Exception as e:
-        logger.error(f"Génération - Erreur dans la fonction generate: {e}")
-        return {"answer": f"Une  erreur s'est produite lors du traitement de votre demande: {e}"}
-
+        logger.error(f"Génération - Erreur lors de l'appel LLM: {e}", exc_info=True)
+        return {"answer": f"Erreur technique lors de la génération de la réponse par le modèle linguistique. Détails: {e}"}
 
 # ================= CREATION DU GRAPHE RAG =================
 
-def build_graph():
-    """Construit et retourne le graphe LangGraph pour le RAG."""
-    
-    logger.info("Construction du graphe RAG.")
+def build_graph() -> StateGraph:
+    """Construit et compile le graphe LangGraph."""
+    logger.info("Construction du graphe RAG...")
+    workflow = StateGraph(State)
+
+    # Ajout des noeuds 
+    workflow.add_node("search_database", search_database)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("generate", generate)
+
+    # Définition des transitions (flux de travail)
+    workflow.add_edge(START, "search_database") # Commence par la recherche BDD
+    workflow.add_edge("search_database", "retrieve") # Puis récupération vectorielle
+    workflow.add_edge("retrieve", "generate")      # Puis génération
+    workflow.add_edge("generate", END)             # Termine après la génération
+
+    # Compilation du graphe
     try:
-        # Définir le graphe
-        workflow = StateGraph(State)
-        
-        # Ajouter les nœuds
-        workflow.add_node("search_database", search_database)
-        workflow.add_node("retrieve", retrieve)
-        workflow.add_node("generate", generate)
-        
-        # Définir les transitions
-        workflow.add_edge(START, "search_database")
-        workflow.add_edge("search_database", "retrieve")
-        workflow.add_edge("retrieve", "generate")
-        workflow.add_edge("generate", END)
-        
-        # Compiler le graphe
         graph = workflow.compile()
-        
-        logger.info("Graphe RAG construit avec succès.")
-        
+        logger.info("Graphe RAG compilé avec succès.")
         return graph
-        
     except Exception as e:
-        logger.error(f"Erreur lors de la construction du graphe: {e}",exc_info=True)
-        raise
+        logger.error(f"Erreur critique lors de la compilation du graphe: {e}", exc_info=True)
+        raise # Renvoyer l'erreur car le système ne peut pas fonctionner sans graphe
 
 # ================= INITIALISATION DU SYSTÈME RAG =================
 
-def init_rag_system():
-    """Initialise le système RAG complet avec deux vector stores séparés."""
-    global knowledge_vector_store, rules_vector_store, llm, embeddings, db_connected
-    
-    logger.info("Début début del'initialisation du système RAG...")
-    
-    # 1. Initialiser les embeddings
+def init_rag_system() -> Dict[str, Any]:
+    """Initialise tous les composants du système RAG (LLM, Embeddings, DB, Vector Stores, Graphe)."""
+    # Utiliser les variables globales pour stocker les objets initialisés
+    global llm, embeddings, db_manager, db_connected
+    global rules_vector_store, official_docs_vector_store, echanges_vector_store
+
+    logger.info("="*20 + " Initialisation du Système RAG " + "="*20)
+
+    status = {
+        "embeddings_ok": False, "llm_ok": False, "db_ok": False,
+        "rules_store_ok": False, "official_docs_store_ok": False, "echanges_store_ok": False,
+        "graph_ok": False,
+        "counts": {"rules": 0, "official": 0, "echanges": 0, "rules_splits": 0, "official_splits": 0, "echanges_splits": 0},
+        "search_function": None,
+        "error_messages": []
+    }
+   
+    graph = None
+
+    # 1. Initialiser Embeddings
     try:
-        # 2. Initialiser les embeddings  
         #embeddings = MistralAIEmbeddings()
-        # Utiliser OpenAIEmbeddings comme spécifié par l'utilisateur
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-        logger.info(f"Embeddings initialisés avec succées")
+        #embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")    
+                    
+        logger.info(f"Embeddings initialisés avec succés")
+        status["embeddings_ok"] = True
     except Exception as e:
-        logger.error(f"Erreur lors de l'initialisation des embeddings: {e}", exc_info=True)
-        # Continuer l'initialisation mais noter l'erreur
-        embeddings = None # S'assurer que embeddings est None si l'initialisation échoue
-        
-        
-     # 2. Initialiser le modèle LLM
+        logger.error(f"Échec initialisation Embeddings: {e}", exc_info=True)
+        status["error_messages"].append(f"Embeddings: {e}")
+        embeddings = None
+
+    # 2. Initialiser LLM
     try:
-        # 1. Initialiser le modèle LLM avec Mistral 
-        #llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
-        # Utiliser GPT-4o-mini comme spécifié par l'utilisateur
-        llm = init_chat_model("gpt-4o-mini", model_provider="openai", temperature=0.1) # temperature basse pour un comportement plus déterministe
-        logger.info(f"Modèle LLM initialisé avec succées")
+        #llm = ChatMistralAI(model="mistral-large-latest")
+        llm = ChatOpenAI(model="gpt-4o") 
+        logger.info(f"LLM initialisé: {type(llm).__name__} (Model: {getattr(llm, 'model', 'N/A')})")
+        status["llm_ok"] = True
     except Exception as e:
-        logger.error(f"Erreur lors de l'initialisation du LLM: {e}", exc_info=True)
-        llm = None # S'assurer que llm est None si l'initialisation échoue
-        
-     # Vérifier si embeddings ou llm ont échoué
-    if embeddings is None or llm is None:
-         logger.critical("Initialisation échouée : Embeddings ou LLM n'ont pas pu être initialisés.")
-         # On peut choisir de quitter ici ou de retourner des objets None et gérer les erreurs plus tard.
-         # Pour ce cas, on va retourner et les étapes suivantes échoueront si elles dépendent de ces objets.
-         return {
-            "knowledge_docs": [],
-            "rules_docs": [],
-            "knowledge_vector_store": None,
-            "rules_vector_store": None,
-            "llm": llm,
-            "graph": None, # Le graphe ne peut pas être construit sans LLM/Embeddings
-            "db_connected": False,
-            
-         }
-    
-    # 3. Charger les documents, avec séparation des règles
-    knowledge_docs, rules_docs = load_all_documents()
-    
-    # 4. Découper les documents
-    # S'assurer qu'il y a des documents avant de découper
-    knowledge_splits = []
-    if knowledge_docs:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        knowledge_splits = text_splitter.split_documents(knowledge_docs)
-        logger.info(f"{len(knowledge_splits)} chunks créés à partir des documents de connaissances.")
-    else:
-         logger.warning("Aucun document de connaissance chargé à découper.")
-    
-    rules_splits = []
-    if rules_docs:
-        # Pour les règles, on utilise un chunk_size plus petit pour préserver l'intégrité des règles
-        rules_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        rules_splits = rules_splitter.split_documents(rules_docs)
-        logger.info(f"{len(rules_splits)} chunks créés à partir des documents de règles.")
-    else:
-         logger.warning("Aucun document de règles chargé à découper.")
-    
-    # 5. Créer les vector stores séparés
-    knowledge_store_cache_dir = os.path.join(CACHE_DIR, "knowledge_store")
-    rules_store_cache_dir = os.path.join(CACHE_DIR, "rules_store")
+        logger.error(f"Échec initialisation LLM: {e}", exc_info=True)
+        status["error_messages"].append(f"LLM: {e}")
+        llm = None
 
-    # Créer le vector store de connaissances seulement s'il y a des splits
-    knowledge_vector_store = create_vector_store(knowledge_splits, embeddings, knowledge_store_cache_dir)
-    if knowledge_vector_store:
-         logger.info("Vector store pour les connaissances créé/chargé.")
-    else:
-         logger.warning("Vector store pour les connaissances non créé/chargé.")
+    if not status["embeddings_ok"] or not status["llm_ok"]:
+        logger.critical("Arrêt de l'initialisation: Embeddings ou LLM manquants.")
+        # AJOUTER la clé graph (avec la valeur None) au status avant de retourner
+        status["graph"] = graph 
+        return status
 
-    
-    # Créer le vector store de règles seulement s'il y a des splits
-    rules_vector_store = create_vector_store(rules_splits, embeddings, rules_store_cache_dir)
-    if rules_vector_store:
-        logger.info("Vector store pour les règles créé/chargé.")
-    else:
-        logger.warning("Vector store pour les règles non créé/chargé.")
-    
-    # 6. Tester la connexion à la base de données
+    # 3. Initialiser et tester la connexion DB
     try:
         db_manager = DatabaseManager()
-        db_connected = db_manager.tester_connexion()
-        
+        if db_manager._is_config_valid(): # Vérifier si la config est là avant de tester
+             db_connected = db_manager.tester_connexion()
+             status["db_ok"] = db_connected
+             if db_connected:
+                 status["search_function"] = db_manager.rechercher_dossier
+                 logger.info("Connexion DB réussie.")
+             else:
+                 logger.warning("Connexion DB échouée (vérifier config et accessibilité).")
+                 status["error_messages"].append("DB: Connexion échouée")
+        else:
+             logger.warning("DB non configurée (variables d'env manquantes).")
+             status["db_ok"] = False
+             status["error_messages"].append("DB: Configuration manquante")
+             db_manager = None # Pas de manager si pas de config
+             db_connected = False
     except Exception as e:
-        logger.error(f"Erreur lors de l'initialisation du DatabaseManager: {e}", exc_info=True)
+        logger.error(f"Erreur initialisation DB Manager: {e}", exc_info=True)
+        status["error_messages"].append(f"DB Manager: {e}")
+        db_manager = None
         db_connected = False
+        status["db_ok"] = False
 
-    
-   # 7. Construire le graphe (peut échouer si LLM est None)
-    graph = None
-    if llm: # Construire le graphe uniquement si l'LLM a été initialisé avec succès
-        try:
-            graph = build_graph()
-            logger.info("Graphe RAG construit.")
-        except Exception as e:
-            logger.error(f"Erreur critique lors de la construction du graphe: {e}", exc_info=True)
-            graph = None
-    else:
-        logger.critical("Graphe RAG non construit car le LLM n'a pas pu être initialisé.")
 
-    logger.info("Initialisation du système RAG terminée.")
+    # 4. Charger tous les documents
+    official_docs, echanges_docs, rules_docs = load_all_documents()
+    status["counts"]["official"] = len(official_docs)
+    status["counts"]["echanges"] = len(echanges_docs)
+    status["counts"]["rules"] = len(rules_docs)
 
-    # Retourner les objets initialisés
-    return {
-        "knowledge_docs": knowledge_docs, # Peut être vide si chargement échoue
-        "rules_docs": rules_docs, # Peut être vide si chargement échoue
-        "knowledge_vector_store": knowledge_vector_store, # Peut être None si création/chargement échoue
-        "rules_vector_store": rules_vector_store, # Peut être None si création/chargement échoue
-        "llm": llm, # Peut être None si initialisation échoue
-        "graph": graph, # Peut être None si construction échoue
-        "db_connected": db_connected,
-        "rechercher_dossier": db_manager.rechercher_dossier
-    
-    }
 
-# Initialisation du graphe
-graph = build_graph()
-rag_system_state = init_rag_system()
+    # 5. Découper les documents
+    general_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=512, add_start_index=True)
+    rules_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=512, add_start_index=True) # Plus petit pour règles
+
+    official_splits = general_splitter.split_documents(official_docs) if official_docs else []
+    echanges_splits = general_splitter.split_documents(echanges_docs) if echanges_docs else []
+    rules_splits = rules_splitter.split_documents(rules_docs) if rules_docs else []
+    status["counts"]["official_splits"] = len(official_splits)
+    status["counts"]["echanges_splits"] = len(echanges_splits)
+    status["counts"]["rules_splits"] = len(rules_splits)
+    logger.info(f"Documents découpés: {len(official_splits)} officiels, {len(echanges_splits)} échanges, {len(rules_splits)} règles.")
+
+
+    # 6. Créer/Charger les Vector Stores
+    rules_store_cache_dir = os.path.join(CACHE_DIR, "rules_store")
+    official_docs_store_cache_dir = os.path.join(CACHE_DIR, "official_docs_store")
+    echanges_store_cache_dir = os.path.join(CACHE_DIR, "echanges_store")
+
+    rules_vector_store = create_vector_store(rules_splits, embeddings, rules_store_cache_dir)
+    status["rules_store_ok"] = rules_vector_store is not None
+    if not status["rules_store_ok"]: status["error_messages"].append("VectorStore Règles: Échec création/chargement")
+
+    official_docs_vector_store = create_vector_store(official_splits, embeddings, official_docs_store_cache_dir)
+    status["official_docs_store_ok"] = official_docs_vector_store is not None
+    if not status["official_docs_store_ok"]: status["error_messages"].append("VectorStore Officiels: Échec création/chargement")
+
+    echanges_vector_store = create_vector_store(echanges_splits, embeddings, echanges_store_cache_dir)
+    status["echanges_store_ok"] = echanges_vector_store is not None
+    if not status["echanges_store_ok"]: status["error_messages"].append("VectorStore Echanges: Échec création/chargement")
+
+    # 7. Construire le graphe 
+    try:
+        graph = build_graph()
+        status["graph_ok"] = True
+        logger.info("Graphe RAG final prêt.")
+    except Exception as e:
+        logger.error(f"Échec construction graphe RAG: {e}", exc_info=True)
+        status["error_messages"].append(f"Graphe: {e}")
+        status["graph_ok"] = False
+        graph = None # Assurer que graph est None si la construction échoue
+
+    status["graph"] = graph 
+
+    logger.info("="*20 + " Fin Initialisation Système RAG " + "="*20)
+
+    if status["error_messages"]:
+         logger.warning(f"Erreurs/Avertissements pendant l'initialisation: {status['error_messages']}")
+
+    return status
+
+# --- Fin de la fonction init_rag_system ---
 
