@@ -1,27 +1,20 @@
-# app.py
-
 import streamlit as st
 import os
 import time
-import pandas as pd 
+import pandas as pd
 import logging
 import json
-from datetime import date, timedelta # timedelta n'est pas utilisé ici mais gardé
-from typing import Dict, Any, List, Optional
 
-
-from src.backend.rag_orchestrator import init_rag_system as init_rag_backend 
-from src.frontend.styles import CSS_STYLES, FOOTER_HTML 
-from src.frontend.components import ( 
-    display_dossier_timeline,
+from src.backend.rag_main import init_rag_system as init_rag_backend
+from src.frontend.styles import CSS_STYLES, FOOTER_HTML
+from src.frontend.components import (
     display_dossier_details_enhanced,
-    display_source, # MODIFIÉ: anciennement display_source_document
     display_dossier_summary,
-    display_dossier_details_df
 )
+
 # --- Configuration du Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("streamlit_app") 
+logger = logging.getLogger("streamlit_app")
 
 # --- Configuration de la Page Streamlit ---
 st.set_page_config(
@@ -40,15 +33,15 @@ st.set_page_config(
 )
 
 # --- Variables d'état (Session State) ---
-def init_session_state_vars(): 
+def init_session_state_vars():
     defaults = {
         'app_mode': "general",
         'initialized': False,
         'chat_history': [],
         'is_processing': False,
         'rag_components': None,
-        'sources_expanded': False, # Ce toggle contrôlera l'expansion par défaut des sources individuelles
-        'show_sources': True,
+        'sources_table_expanded': True, 
+        'show_sources': True, 
         'show_db_results': True,
         'last_result': None,
         'error_message': None,
@@ -66,7 +59,7 @@ def init_session_state_vars():
 init_session_state_vars()
 
 # --- Importation et Initialisation du Module RAG (Backend) ---
-rag_import_success = True 
+rag_import_success = True
 try:
     if not st.session_state.initialized:
         placeholder = st.empty()
@@ -74,7 +67,7 @@ try:
             with st.spinner("⏳ Initialisation de l'assistant, veuillez patienter..."):
                 try:
                     start_time = time.time()
-                    st.session_state.rag_components = init_rag_backend() 
+                    st.session_state.rag_components = init_rag_backend()
                     
                     if isinstance(st.session_state.rag_components, dict) and \
                        st.session_state.rag_components.get("graph_ok") and \
@@ -101,22 +94,21 @@ try:
                     st.session_state.system_status_msg = "❌ Erreur critique init."
                     st.error(st.session_state.error_message)
         placeholder.empty()
-except Exception as e: 
+except Exception as e:
     rag_import_success = False
     st.session_state.initialized = False
     st.session_state.system_status_msg = "❌ Module RAG Orchestrator introuvable."
     st.error(f"Impossible de charger le module backend: {e}")
     logger.error(f"Échec import src.rag_orchestrator: {e}", exc_info=True)
 
-
 # --- Application des Styles CSS ---
 st.markdown(CSS_STYLES, unsafe_allow_html=True)
 
 
-# --- Fonctions Utilitaires de l'UI (celles qui restent dans app.py) ---
-def save_chat_history_to_file(): 
+# --- Fonctions Utilitaires de l'UI 
+def save_chat_history_to_file():
     try:
-        history_dir = os.path.join(".", "data", "chat_history") 
+        history_dir = os.path.join(".", "data", "chat_history")
         os.makedirs(history_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(history_dir, f"chat_{timestamp}.json")
@@ -133,7 +125,7 @@ def load_chat_history_from_file(filename: str) -> bool:
         with open(filename, "r", encoding="utf-8") as f:
             st.session_state.chat_history = json.load(f)
         logger.info(f"Historique chargé depuis {filename}")
-        st.session_state.last_result = None 
+        st.session_state.last_result = None
         return True
     except FileNotFoundError:
         st.session_state.error_message = f"Fichier {filename} non trouvé."
@@ -158,15 +150,15 @@ def process_user_query(query: str) -> str:
         initial_state = {
             "question": query,
             "context": [], "db_results": [], "answer": "",
-            "history": st.session_state.chat_history[-5:] 
+            "history": st.session_state.chat_history[-5:]
         }
         
         start_time = time.time()
-        result = graph.invoke(initial_state) 
+        result = graph.invoke(initial_state)
         processing_time = time.time() - start_time
-        logger.info(f"Requête traitée en {processing_time:.2f}s. Résultat: {type(result)}")
+        logger.info(f"Requête traitée en {processing_time:.2f}s.")
         
-        st.session_state.last_result = result 
+        st.session_state.last_result = result
         return result.get("answer", "Pas de réponse claire obtenue.")
 
     except Exception as e:
@@ -174,7 +166,6 @@ def process_user_query(query: str) -> str:
         return f"Erreur lors du traitement: {e}"
     finally:
         st.session_state.is_processing = False
-
 
 # ===== INTERFACE PRINCIPALE =====
 if not st.session_state.initialized and rag_import_success:
@@ -185,7 +176,7 @@ elif not rag_import_success:
 
 # --- Barre Latérale ---
 with st.sidebar:
-    st.image("src/frontend/logo_region_reunion.png", width=150) 
+    st.image("src/frontend/logo_region_reunion.png", width=150)
     st.header("⚙️ Contrôle Système")
     st.title("Assistant KAP Numérique")
 
@@ -196,10 +187,25 @@ with st.sidebar:
     st.markdown(f"**Statut:** <span style='color:{status_color};'>{status_text}</span>", unsafe_allow_html=True)
 
     with st.expander("👁️ Options d'Affichage", expanded=True):
-        st.session_state.show_sources = st.toggle("Afficher sources", value=st.session_state.show_sources, key="toggle_src")
-        st.session_state.show_db_results = st.toggle("Afficher détails dossiers trouvés", value=st.session_state.show_db_results, key="toggle_db")
-        # Ce toggle contrôle maintenant si les sources individuelles sont développées par défaut
-        st.session_state.sources_expanded = st.toggle("Développer sources", value=st.session_state.sources_expanded, key="toggle_exp_src")
+        st.session_state.show_sources = st.toggle(
+            "Afficher section sources", 
+            value=st.session_state.show_sources, 
+            key="toggle_show_src_section"
+        )
+    
+        if st.session_state.show_sources: # On n'affiche ce toggle que si la section des sources est visible
+            st.session_state.sources_table_expanded = st.toggle(
+                "Développer tableau sources", 
+                value=st.session_state.sources_table_expanded, 
+                key="toggle_expand_src_table"
+            )
+        
+        st.session_state.show_db_results = st.toggle(
+            "Afficher détails dossiers trouvés", 
+            value=st.session_state.show_db_results, 
+            key="toggle_db"
+        )
+
 
     with st.expander("🕒 Gestion Historique", expanded=False):
         col_h1, col_h2 = st.columns(2)
@@ -251,22 +257,52 @@ with tab_general:
                 with st.chat_message(message["role"], avatar=avatar):
                     st.write(message["content"])
     
+    # Affichage des sources et détails si applicable (après le chat)
     if st.session_state.last_result and isinstance(st.session_state.last_result, dict) :
-        sources = st.session_state.last_result.get('context', [])
-        if st.session_state.show_sources and isinstance(sources, list) and sources:
-            # MODIFIÉ: Suppression de l'expander externe.
-            # Le titre est maintenant un simple markdown.
-            st.markdown(f"### 📚 {len(sources)} source(s) utilisée(s)")
-            for i, src_doc in enumerate(sources):
-                # MODIFIÉ: Appel à display_source et passage de st.session_state.sources_expanded
-                display_source(src_doc, i, expanded_by_default=st.session_state.sources_expanded)
+        
+        sources_docs = st.session_state.last_result.get('context', [])
+        
+        if st.session_state.show_sources and isinstance(sources_docs, list) and sources_docs:
+            st.markdown("---") 
+           
+            expander_label = f"📊 Sources consultées ({len(sources_docs)} utilisée(s))"
+            with st.expander(expander_label, expanded=st.session_state.sources_table_expanded):
+              
+                source_data_for_df = []
+                for i, doc in enumerate(sources_docs):
+                    try:
+                        source_name = doc.metadata.get('source', 'N/A')
+                        doc_type = doc.metadata.get('type', doc.metadata.get('document_type', 'N/A'))
+                        content_preview = doc.page_content
+                        if len(content_preview) > 150:
+                            content_preview = content_preview[:150] + "..."
+                        
+                        source_data_for_df.append({
+                            "Source": source_name,
+                            "Type": doc_type,
+                            "Contenu": content_preview
+                        })
+                    except AttributeError:
+                        logger.warning(f"La source {i+1} (type: {type(doc)}) n'a pas les attributs 'metadata' ou 'page_content' attendus.")
+                        source_data_for_df.append({"Source": "Erreur de format", "Type": "N/A", "Contenu": "Impossible d'extraire."})
+                    except Exception as e:
+                        logger.error(f"Erreur inattendue lors du traitement de la source {i+1}: {e}")
+                        source_data_for_df.append({"Source": "Erreur inconnue", "Type": "N/A", "Contenu": f"Erreur: {e}"})
+
+                if source_data_for_df:
+                    df_sources = pd.DataFrame(source_data_for_df)
+                    st.dataframe(
+                        df_sources, 
+                        use_container_width=True, 
+                        hide_index=False
+                    )
         
         db_results = st.session_state.last_result.get('db_results', [])
         if st.session_state.show_db_results and isinstance(db_results, list) and db_results:
-            with st.expander("📋 Dossiers Mentionnés/Trouvés", expanded=True):
-                for dossier_data in db_results: 
+            with st.expander("📋 Dossiers Mentionnés/Trouvés", expanded=True): 
+                for dossier_data in db_results:
                     if isinstance(dossier_data, dict):
-                        display_dossier_summary(dossier_data) 
+                        display_dossier_summary(dossier_data)
                     else:
                         st.warning(f"Format de résultat dossier BDD inattendu: {type(dossier_data)}")
 
@@ -300,33 +336,50 @@ with tab_dossier_consult:
     search_doss_btn = b_col.button("🔎 Rechercher", use_container_width=True, key="search_doss_btn", disabled=not st.session_state.initialized)
 
     if search_doss_btn:
-        term = dossier_search_term
-        statut = st.session_state.filter_statut if st.session_state.filter_statut != "Tous" else None
-        instr = st.session_state.filter_instructeur if st.session_state.filter_instructeur != "Tous" else None
-        dd = st.session_state.filter_date_debut
-        df = st.session_state.filter_date_fin
+        term = dossier_search_term.strip() # .strip() pour enlever les espaces en trop
+        statut_param = st.session_state.filter_statut if st.session_state.filter_statut != "Tous" else None
+        instr_param = st.session_state.filter_instructeur if st.session_state.filter_instructeur != "Tous" else None
+        
+        # Récupérer les dates de l'expander
+        date_debut_expander = st.session_state.filter_date_debut
+        date_fin_expander = st.session_state.filter_date_fin
 
-        if not any([term, statut, instr, dd, df]):
-            st.warning("Veuillez entrer un terme ou sélectionner un filtre.")
+        # Déterminer les dates à envoyer au backend
+        final_date_debut = None
+        final_date_fin = None
+
+        if not term: # Si la barre de recherche principale est vide, on utilise les filtres de l'expander (y compris les dates)
+            final_date_debut = date_debut_expander
+            final_date_fin = date_fin_expander
+      
+        if not any([term, statut_param, instr_param, final_date_debut, final_date_fin]):
+            st.warning("Veuillez entrer un terme ou sélectionner au moins un filtre.")
             st.session_state.dossier_search_results = []
         else:
             search_func = st.session_state.rag_components.get("search_function") 
             if callable(search_func):
                 with st.spinner("Recherche des dossiers..."):
                     try:
+                        logger.info(f"Appel recherche frontend: term='{term}', statut='{statut_param}', instr='{instr_param}', dd='{final_date_debut}', df='{final_date_fin}'")
                         found = search_func(
-                            search_term=term if term else None, statut=statut, instructeur=instr,
-                            date_debut_creation=dd, date_fin_creation=df
+                            search_term=term if term else None, # Le backend gère si 'term' est un numéro exact
+                            statut=statut_param,
+                            instructeur=instr_param,
+                            date_debut_creation=final_date_debut, # Utiliser les dates conditionnellement définies
+                            date_fin_creation=final_date_fin    # Utiliser les dates conditionnellement définies
                         )
                         st.session_state.dossier_search_results = found
-                        if found: st.success(f"{len(found)} dossier(s) trouvé(s).")
-                        else: st.info("Aucun dossier ne correspond à vos critères.")
+                        if found: 
+                            st.success(f"{len(found)} dossier(s) trouvé(s).")
+                        else: 
+                            st.info("Aucun dossier ne correspond à vos critères de recherche.")
                     except Exception as e:
                         logger.error(f"Erreur recherche dossier (UI): {e}", exc_info=True)
-                        st.error(f"Erreur recherche: {e}")
-                        st.session_state.dossier_search_results = None
+                        st.error(f"Erreur lors de la recherche: {str(e)}") 
+                        
+                        st.session_state.dossier_search_results = None # Réinitialiser en cas d'erreur
             else:
-                st.error("Fonction de recherche de dossier non disponible.")
+                st.error("Fonction de recherche de dossier non disponible ou non initialisée.")
                 st.session_state.dossier_search_results = None
     
     if 'dossier_search_results' in st.session_state and st.session_state.dossier_search_results:
@@ -338,8 +391,7 @@ with tab_dossier_consult:
             else:
                 st.warning(f"Format résultat dossier inattendu (idx {idx}): {type(dossier_item)}")
                 st.json(dossier_item)
-
-
+                
 # --- Traitement Centralisé des Questions (après chaque interaction) ---
 if st.session_state.chat_history and \
    st.session_state.chat_history[-1]["role"] == "user" and \
@@ -351,7 +403,7 @@ if st.session_state.chat_history and \
     st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
     st.rerun() 
 
-# --- Zone de Saisie du Chat (toujours en bas) ---
+
 user_prompt = st.chat_input(
     "Posez votre question ici...", 
     key="main_chat_input",
@@ -360,6 +412,5 @@ user_prompt = st.chat_input(
 if user_prompt:
     st.session_state.chat_history.append({"role": "user", "content": user_prompt})
     st.rerun()
-
 # --- Footer ---
 st.markdown(FOOTER_HTML, unsafe_allow_html=True)

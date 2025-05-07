@@ -1,13 +1,12 @@
-# src/frontend/components.py
-
 import streamlit as st
 import pandas as pd
 from datetime import date
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 import logging
 
 logger = logging.getLogger(__name__)
-
+# --- Configuration du Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 def get_dossier_data_for_timeline(numero_dossier: str) -> Optional[Dict]:
     """
     Récupère les données d'un dossier spécifique pour la timeline.
@@ -129,7 +128,7 @@ def display_source(source_doc: Any, index: int, expanded_by_default: bool = Fals
 
         content = source_doc.page_content
         if len(content) > 500:
-            # L'expander interne utilise maintenant expanded_by_default
+           
             with st.expander("Voir le contenu complet", expanded=expanded_by_default):
                 st.markdown(f'<div class="source-box">{content}</div>', unsafe_allow_html=True)
             st.text(content[:500] + "...") # Aperçu toujours visible en dehors de l'expander

@@ -1,5 +1,3 @@
-# src/db_manager.py
-
 import os
 import mysql.connector
 import logging
@@ -7,7 +5,6 @@ import re
 from datetime import date
 from typing import List, Dict, Any, Optional
 
-# Configuration du logging (chaque module peut avoir son propre logger)
 logger = logging.getLogger(__name__) # Utilise le nom du module actuel
 
 class DatabaseManager:
@@ -67,34 +64,44 @@ class DatabaseManager:
                       limit: Optional[int] = 50,
                       **kwargs) -> List[Dict[str, Any]]:
         """
-        Recherche des dossiers dans la base de données.
+        Recherche des dossiers dans la base de données avec gestion des erreurs et fermeture de connexion.
         """
         if not self._is_config_valid():
             return []
+
         conn = None
         cursor = None
         try:
-            conn = mysql.connector.connect(**self.config, connect_timeout=10)
-            cursor = conn.cursor(dictionary=True)
+            conn = mysql.connector.connect(**self.config, connect_timeout=10) # Timeout un peu plus long pour query
+            cursor = conn.cursor(dictionary=True) # Résultats sous forme de dict
+
             base_query = "SELECT * FROM dossiers"
             conditions = []
             parametres = []
 
+            # Priorité au numéro de dossier s'il est fourni directement
             if numero_dossier:
                 conditions.append("Numero = %s")
                 parametres.append(numero_dossier.strip())
+                logger.info(f"Recherche BDD par numéro direct: {numero_dossier.strip()}")
+            # Sinon, analyser search_term
             elif search_term:
                 cleaned_term = search_term.strip()
+                # Format exact XX-YYYY ou XX YYYY
                 is_exact_numero = re.fullmatch(r'\d{2}[-\s]?\d{4}', cleaned_term)
                 if is_exact_numero:
+                    # Normaliser au format XX-YYYY pour la recherche
                     normalized_numero = re.sub(r'\s', '-', cleaned_term)
                     conditions.append("Numero = %s")
                     parametres.append(normalized_numero)
+                    logger.info(f"Recherche BDD par numéro exact détecté dans search_term: {normalized_numero}")
                 else:
                     conditions.append("(Numero LIKE %s OR nom_usager LIKE %s)")
                     fuzzy_term = f"%{cleaned_term}%"
                     parametres.extend([fuzzy_term, fuzzy_term])
+                    logger.info(f"Recherche BDD floue (numéro/nom) pour: {cleaned_term}")
 
+            # Autres filtres
             if statut and statut.lower() != "tous":
                 conditions.append("statut = %s")
                 parametres.append(statut)
@@ -107,30 +114,38 @@ class DatabaseManager:
             if date_fin_creation:
                  conditions.append("date_creation <= %s")
                  parametres.append(date_fin_creation)
+                 # Vérification simple de cohérence
                  if date_debut_creation and date_debut_creation > date_fin_creation:
                       logger.warning("Date de début postérieure à la date de fin dans la recherche BDD.")
+
+            # Critères kwargs (utiliser avec prudence si les clés viennent de l'extérieur)
             for cle, valeur in kwargs.items():
                 if valeur is not None:
-                    conditions.append(f"`{cle}` = %s")
+                    # Exemple simple, pourrait nécessiter une validation des clés
+                    conditions.append(f"`{cle}` = %s") # Backticks pour noms de colonnes
                     parametres.append(valeur)
 
+            # Construction de la requête finale
             requete = base_query
             if conditions:
                 requete += " WHERE " + " AND ".join(conditions)
-            requete += " ORDER BY derniere_modification DESC"
-            
+            requete += " ORDER BY derniere_modification DESC" # Trier par défaut
+
+            # Appliquer la limite seulement si ce n'est pas une recherche par numéro exact
             apply_limit = True
             if numero_dossier or (search_term and re.fullmatch(r'\d{2}[-\s]?\d{4}', search_term.strip())):
                 apply_limit = False
+
             if apply_limit and limit is not None and limit > 0:
                 requete += " LIMIT %s"
                 parametres.append(limit)
 
             logger.info(f"Exécution requête BDD: {requete} | Params: {parametres}")
-            cursor.execute(requete, tuple(parametres))
+            cursor.execute(requete, tuple(parametres)) # Exécuter avec un tuple de paramètres
             resultats = cursor.fetchall()
             logger.info(f"{len(resultats)} dossiers trouvés dans la BDD.")
             return resultats
+
         except mysql.connector.Error as erreur:
             logger.error(f"Erreur lors de la recherche BDD: {erreur}")
             return []
@@ -138,13 +153,9 @@ class DatabaseManager:
             logger.error(f"Erreur inattendue dans rechercher_dossier: {e}", exc_info=True)
             return []
         finally:
+            # Assurer la fermeture du curseur et de la connexion
             if cursor:
                 cursor.close()
             if conn and conn.is_connected():
                 conn.close()
-
-    # Si tu as une fonction get_distinct_values_func qui interroge la BDD,
-    # elle devrait aussi être ici.
-    # def get_distinct_values(self, column_name: str) -> List[str]:
-    #     # ... logique pour récupérer les valeurs distinctes d'une colonne
-    #     pass
+                
