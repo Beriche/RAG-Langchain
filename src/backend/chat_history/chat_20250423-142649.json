@@ -1,0 +1,26 @@
+[
+  {
+    "role": "user",
+    "content": "Urgent : dossier 82-2415\nBonjour,\n\nPouvez-vous me dire si le paiement a été ordonné cette fois s'il vous plaît.\n\nCordialement,  Kassim Riday\n"
+  },
+  {
+    "role": "assistant",
+    "content": "Concernant votre dossier Kap Numérik n° 82-2415, nous confirmons qu’il est bien pris en charge. Le nécessaire pour le paiement sera effectué dans les meilleurs délais, et vous serez informé dès que le remboursement sera réalisé."
+  },
+  {
+    "role": "user",
+    "content": "et vous n'avez pas de dates précise ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Bonjour,\n\nNous comprenons votre besoin de recevoir les fonds avant la fin de l’année. Malheureusement, nous ne pouvons pas vous garantir une date précise de versement, car cela dépend du traitement par la paierie régionale. Nous vous informerons dès que le virement sera effectué.\n\nPour clarifier, la pièce de paiement relative à votre dossier Kap Numérik a été créée et sera transmise à la paierie régionale pour traitement. C’est la paierie régionale qui effectue le virement. Nous ne maîtrisons pas les dates exactes de paiement, mais vous serez informé dès que le virement sera réalisé.\n\nNous vous remercions de votre compréhension et restons à votre disposition pour toute autre question.\n\nCordialement,"
+  },
+  {
+    "role": "user",
+    "content": "Merci"
+  },
+  {
+    "role": "assistant",
+    "content": "Merci pour votre message.\n\nSi vous avez d'autres questions ou besoin de précisions supplémentaires, n'hésitez pas à me les poser. Je suis à votre disposition pour vous assister.\n\nCordialement,"
+  }
+]

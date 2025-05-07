@@ -1,0 +1,14 @@
+[
+  {
+    "role": "user",
+    "content": "Quels sont les critères d’éligibilité ?"
+  },
+  {
+    "role": "user",
+    "content": "Quels sont les critères d’éligibilité ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Erreur lors de la génération de la réponse : Error response 429 while fetching https://api.mistral.ai/v1/chat/completions: {\"message\":\"Requests rate limit exceeded\"}"
+  }
+]
