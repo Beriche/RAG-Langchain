@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 import os
+from pyexpat import model
 import re
 import hashlib
 import mysql.connector
@@ -10,28 +10,34 @@ from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 
-# Langchain Imports - Mettre à jour selon les versions récentes
+# Langchain Imports 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
-from langchain.document_loaders import DirectoryLoader, TextLoader
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# FAISS est maintenant dans langchain_community
+
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 # Importer les modèles spécifiques utilisés
 from langchain_mistralai.chat_models import ChatMistralAI
 from langchain_mistralai import MistralAIEmbeddings
 # Décommenter si OpenAI est utilisé
-# from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-
+from langchain_openai.embeddings import OpenAIEmbeddings 
+from langchain_openai.chat_models import ChatOpenAI
 from langgraph.graph import StateGraph, END, START
+from openai import OpenAI
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("rag_module")
 
+
+
 # Chargement des variables d'environnement
 load_dotenv()
+
 
 # Chemins vers les répertoires de données
 DATA_ROOT = os.getenv("DATA_ROOT", "../data") # S'assurer que ce chemin est correct par rapport à l'exécution
@@ -219,126 +225,306 @@ class DatabaseManager:
 
 # === GESTION DES DOCUMENTS ET EMBEDDINGS ====
 
+def format_table(table_data: Dict[str, Any]) -> str:
+    """Formate un dictionnaire représentant une table en Markdown."""
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+    title = table_data.get("title")
+    if not headers or not rows:
+        return ""
+
+    table_str = ""
+    if title:
+        table_str += f"**{title}**\n"
+
+    header_line = " | ".join(str(h).strip() for h in headers)
+    separator = " | ".join(["---"] * len(headers))
+    row_lines = []
+    for row in rows:
+        cells = []
+        for h in headers:
+            cell_content = row.get(h, "")
+            # Si le contenu est une liste, joindre avec des sauts de ligne DANS la cellule
+            if isinstance(cell_content, list):
+                 # Utiliser <br> pour saut de ligne en Markdown table si nécessaire, ou juste joindre
+                 cell_str = ", ".join(str(item).strip() for item in cell_content if str(item).strip())
+            else:
+                 cell_str = str(cell_content).strip()
+            cells.append(cell_str)
+        row_lines.append(" | ".join(cells))
+
+    table_str += "\n".join([header_line, separator] + row_lines)
+    return table_str.strip()
+
+def format_content(block_type: str, content: Any) -> str:
+    """
+    Formate le contenu d'un bloc selon son type en texte lisible,
+    gérant les structures simples et complexes/imbriquées.
+    """
+    text_parts = [] # Collecte les morceaux de texte formaté
+
+    if not content:
+        return ""
+
+    # --- Types simples ---
+    if block_type in ["text", "paragraph", "footer_info", "link"]:
+        # Pour footer_info et link, le contenu est un dict, on cherche 'text'
+        if isinstance(content, dict):
+            text = content.get("text", "")
+            if block_type == "link":
+                 text = f"Lien : {text}" # Préciser que c'est un lien
+        elif isinstance(content, str):
+             text = content
+        else:
+             text = str(content) # Fallback
+        cleaned_text = text.strip()
+        if cleaned_text:
+            text_parts.append(cleaned_text)
+
+    elif block_type == "subheading": # Trouvé dans les QA complexes
+        if isinstance(content, dict) and "text" in content:
+             text_parts.append(f"**{content['text'].strip()}**")
+        elif isinstance(content, str):
+             text_parts.append(f"**{content.strip()}**")
+
+
+    # --- Listes ---
+    elif block_type == "list":
+        items_to_format = []
+        # Contenu peut être une liste directe (moins courant dans votre schéma) ou un dict avec 'items'
+        list_content = content.get("items", []) if isinstance(content, dict) else (content if isinstance(content, list) else [])
+
+        for item in list_content:
+            if isinstance(item, dict):
+                # Gérer des items de liste complexes si nécessaire (pas vu dans vos exemples)
+                # Pour l'instant, on convertit le dict en string simple
+                item_text = json.dumps(item, ensure_ascii=False) # Ou une représentation plus sympa
+            else:
+                item_text = str(item).strip()
+
+            if item_text:
+                 items_to_format.append(f"- {item_text}")
+        if items_to_format:
+             text_parts.append("\n".join(items_to_format))
+
+    elif block_type == "list_structured":
+        title = content.get("title", "")
+        items = content.get("items", [])
+        if title:
+            text_parts.append(f"**{title}**")
+        structured_list_parts = []
+        for item in items:
+            item_str_parts = []
+            # Formatage spécifique pour la structure "demandeur/documents"
+            if "demandeur" in item and "documents" in item:
+                 item_str_parts.append(f"  * Demandeur : {item['demandeur']}")
+                 docs = item['documents']
+                 if isinstance(docs, list):
+                     doc_lines = [f"    - {doc}" for doc in docs if str(doc).strip()]
+                     if doc_lines:
+                          item_str_parts.append("  * Documents :\n" + "\n".join(doc_lines))
+                 else:
+                     item_str_parts.append(f"  * Documents : {docs}") # Fallback
+            else: # Formatage générique clé: valeur pour d'autres structures
+                 for key, value in item.items():
+                     item_str_parts.append(f"  * {key.capitalize()} : {value}")
+            structured_list_parts.append("\n".join(item_str_parts))
+        if structured_list_parts:
+             text_parts.append("\n\n".join(structured_list_parts))
+
+
+    # --- Questions/Réponses ---
+    elif block_type == "qa":
+        if isinstance(content, dict):
+            question = content.get("question", "")
+            answer_raw = content.get("answer") or content.get("answer_list") # Priorité à 'answer'
+            answer_heading = content.get("answer_heading") # Pour "Dépenses non éligibles :"
+            answer_intro = content.get("answer_intro") # Pour "Le prestataire..."
+
+            # Format Question
+            if question:
+                 text_parts.append(f"**Question :** {str(question).strip()}")
+
+            # Format Answer
+            answer_formatted_parts = []
+            if answer_heading:
+                answer_formatted_parts.append(f"*{answer_heading}*")
+            if answer_intro:
+                answer_formatted_parts.append(answer_intro.strip())
+
+            if isinstance(answer_raw, list):
+                 # Cas 1: Liste de strings (answer_list)
+                 if all(isinstance(item, str) for item in answer_raw):
+                      list_items = [f"- {item.strip()}" for item in answer_raw if item.strip()]
+                      if list_items:
+                          answer_formatted_parts.append("\n".join(list_items))
+                 # Cas 2: Liste de dictionnaires (structure complexe dans 'answer')
+                 elif all(isinstance(item, dict) for item in answer_raw):
+                      for sub_block in answer_raw:
+                          sub_type = sub_block.get("type")
+                          sub_content = sub_block.get("content", sub_block.get("text", sub_block.get("items", sub_block.get("table", sub_block)))) # Essayer plusieurs clés
+                          # Appel récursif pour formater les sous-blocs
+                          formatted_sub_content = format_content(sub_type, sub_content)
+                          if formatted_sub_content:
+                              answer_formatted_parts.append(formatted_sub_content)
+            # Cas 3: Réponse simple (string)
+            elif isinstance(answer_raw, str):
+                 cleaned_answer = answer_raw.strip()
+                 if cleaned_answer:
+                      answer_formatted_parts.append(cleaned_answer)
+
+            # Assembler la partie Réponse
+            if answer_formatted_parts:
+                 text_parts.append("**Réponse :**\n" + "\n".join(answer_formatted_parts))
+
+    # --- Tables ---
+    elif block_type in ["qa_table", "table"]:
+        if isinstance(content, dict):
+            # Si c'est qa_table, il y a une question
+            question = content.get("question", "")
+            if block_type == "qa_table" and question:
+                 text_parts.append(f"**Question :** {str(question).strip()}")
+
+            table_data = content.get("table", content) # 'table' dans qa_table, ou 'content' direct pour type 'table'
+            formatted_table = format_table(table_data)
+            if formatted_table:
+                 text_parts.append(f"**Tableau :**\n{formatted_table}")
+
+
+    # --- Steps ---
+    elif block_type == "qa_steps":
+         if isinstance(content, dict):
+             question = content.get("question", "")
+             steps = content.get("steps", [])
+             if question:
+                  text_parts.append(f"**Question :** {str(question).strip()}")
+             steps_formatted_parts = []
+             for step in steps:
+                 step_num = step.get("step", "?")
+                 title = step.get("title", "")
+                 description = step.get("description", "")
+                 step_part = f"**Étape {step_num} : {title}**"
+                 if isinstance(description, list):
+                      desc_items = [f"- {d.strip()}" for d in description if d.strip()]
+                      if desc_items:
+                           step_part += "\n" + "\n".join(desc_items)
+                 elif isinstance(description, str) and description.strip():
+                      step_part += f"\n{description.strip()}"
+                 steps_formatted_parts.append(step_part)
+             if steps_formatted_parts:
+                  text_parts.append("**Étapes :**\n" + "\n\n".join(steps_formatted_parts))
+
+
+    # --- Contact Info (souvent imbriqué) ---
+    elif block_type == "contact_info":
+         if isinstance(content, dict):
+             org = content.get("organisation", "")
+             methods = content.get("methods", [])
+             avail = content.get("availability", "")
+             contact_parts = []
+             if org:
+                  contact_parts.append(f"- Organisation : {org}")
+             if methods:
+                  method_lines = [f"  - {m.get('type', '?')} : {m.get('value', 'N/A')}" for m in methods]
+                  contact_parts.append("- Méthodes de contact :\n" + "\n".join(method_lines))
+             if avail:
+                  contact_parts.append(f"- Disponibilité : {avail}")
+             if contact_parts:
+                 text_parts.append("**Informations de Contact :**\n" + "\n".join(contact_parts))
+
+    # --- Gestion des types inconnus ou non explicitement gérés ---
+    else:
+        # Essayer une conversion simple en string, si pertinent
+        str_content = str(content).strip()
+        if len(str_content) > 20: # Éviter les "[{...}]" ou "{}" vides
+            logger.warning(f"Type de bloc '{block_type}' non géré explicitement, tentative de conversion str.")
+            text_parts.append(f"[{block_type.upper()}] : {str_content}") # Indiquer le type non géré
+
+    # Retourner le texte assemblé pour ce bloc
+    return "\n".join(text_parts).strip()
+
+
 def load_official_docs_from_json(official_docs_path: str) -> List[Document]:
-    """
-    Charge les documents officiels depuis des fichiers JSON dans un répertoire,
-    en gérant les types de blocs 'text' et 'qa' (y compris lorsque
-    question/réponse sont des listes).
-    """
+    """Charge les documents JSON en extrayant tous les types de blocs pour le contexte RAG."""
     docs: List[Document] = []
     if not os.path.isdir(official_docs_path):
-        logger.warning(f"Répertoire des documents officiels non trouvé: {official_docs_path}")
+        logger.warning(f"Répertoire non trouvé : {official_docs_path}")
         return docs
 
+    # Correction: Utiliser *.json pour trouver tous les fichiers
     json_files = glob.glob(os.path.join(official_docs_path, "*.json"))
-    logger.info(f"Chargement docs officiels: {len(json_files)} fichiers JSON trouvés dans {official_docs_path}.")
+    logger.info(f"{len(json_files)} fichiers JSON trouvés dans {official_docs_path}.")
 
     for json_file in json_files:
-        logger.debug(f"Traitement du fichier: {json_file}")
+        logger.info(f"--- Traitement de {os.path.basename(json_file)} ---")
         try:
             with open(json_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
             doc_meta = data.get("document_metadata", {})
             global_meta = data.get("global_block_metadata", {})
-            blocks_data = [] # Pour stocker le texte formaté de ce document
+            blocks_data = []
+            block_count = 0 # Compteur pour le log final du fichier
 
-            # Extraire et concaténer le contenu textuel avec contexte structurel
             for page in data.get("pages", []):
-                page_num = page.get("page_number", "")
+                page_num = page.get("page_number", "N/P") # Page non spécifiée
                 for section in page.get("sections", []):
-                    title = section.get("section_title", "")
-                    for block_index, block in enumerate(section.get("content_blocks", [])): # Ajouter un index pour le debug
-                        block_type = block.get("type")
-                        block_content = block.get("content")
-                        extracted_text = "" # Texte à extraire de ce bloc
+                    title = section.get("section_title", "Sans Titre")
+                    sec_id = section.get("section_id", "N/A")
+                    logger.debug(f"  Traitement Section: '{title}' (ID: {sec_id}, Page: {page_num})")
+                    for block_index, block in enumerate(section.get("content_blocks", [])):
+                        block_type = block.get("type", "unknown")
+                        content = block.get("content")
+                        block_id = block.get("metadata", {}).get("block_id", f"sec_{sec_id}_idx_{block_index}") # Créer un ID si absent
 
-                        # --- Logique d'extraction adaptée ---
-                        if block_type == "text" and isinstance(block_content, str):
-                            cleaned_text = block_content.strip()
-                            if cleaned_text:
-                                extracted_text = cleaned_text
-                                logger.debug(f"  [Fichier: {os.path.basename(json_file)}] Bloc texte trouvé (Page {page_num}, Section '{title}', Bloc {block_index})")
+                        logger.debug(f"    Traitement Bloc: Type='{block_type}', ID='{block_id}'")
 
-                        elif block_type == "qa" and isinstance(block_content, dict):
-                            logger.debug(f"  [Fichier: {os.path.basename(json_file)}] Bloc QA trouvé (Page {page_num}, Section '{title}', Bloc {block_index})")
-                            # Récupérer question et réponse brutes
-                            question_raw = block_content.get("question", "")
-                            answer_raw = block_content.get("answer", "")
+                        # --- Appel de la fonction format_content améliorée ---
+                        text = format_content(block_type, content)
+                        # --- Fin de l'appel ---
 
-                            # --- Traitement robuste pour question ---
-                            question_str = ""
-                            if isinstance(question_raw, str):
-                                question_str = question_raw.strip()
-                            elif isinstance(question_raw, list):
-                                # Joindre les éléments de la liste (non vides après strip) avec un saut de ligne
-                                question_str = "\n".join(str(item).strip() for item in question_raw if str(item).strip())
-                                if question_str: logger.debug("    Question (liste) jointe.")
-                            else:
-                                logger.warning(f"    Type inattendu pour 'question' dans bloc QA ({type(question_raw)}), ignoré. Contenu: {question_raw!r}")
+                        if text:
+                            header = f"Page {page_num}"
+                            if title != "Sans Titre": # N'afficher que si pertinent
+                                header += f" - Section : {title}"
+                            # Ajouter l'ID du bloc et le type peut aider au débogage ou à un ciblage fin
+                            blocks_data.append(f"### {header} (Type : {block_type} / ID: {block_id})\n\n{text}")
+                            block_count += 1
+                            logger.debug(f"      -> Bloc {block_type} extrait (ID: {block_id})")
+                        else:
+                            logger.debug(f"      -> Bloc {block_type} vide ou non traité (ID: {block_id})")
 
-                            # --- Traitement robuste pour réponse ---
-                            answer_str = ""
-                            if isinstance(answer_raw, str):
-                                answer_str = answer_raw.strip() # C'est ici que l'erreur se produisait potentiellement
-                            elif isinstance(answer_raw, list):
-                                # Joindre les éléments de la liste (non vides après strip) avec un saut de ligne
-                                answer_str = "\n".join(str(item).strip() for item in answer_raw if str(item).strip())
-                                if answer_str: logger.debug("    Réponse (liste) jointe.")
-                            else:
-                                logger.warning(f"    Type inattendu pour 'answer' dans bloc QA ({type(answer_raw)}), ignoré. Contenu: {answer_raw!r}")
-
-                            # Construire le texte extrait seulement si on a une question ou une réponse non vide
-                            if question_str or answer_str:
-                                extracted_text = f"Question : {question_str}\nRéponse : {answer_str}"
-                            else:
-                                logger.debug("    Bloc QA ignoré (question et réponse vides après traitement).")
-
-
-                        # --- Fin de la logique adaptée ---
-
-                        # Ajouter le texte extrait (si existant) avec son en-tête structurel
-                        if extracted_text:
-                            block_header = f"Page {page_num}"
-                            if title: block_header += f" - Section: {title}"
-                            # Inclure le type de bloc peut être utile pour le contexte LLM
-                            blocks_data.append(f"### {block_header} (Type: {block_type})\n\n{extracted_text}")
-
-            # Si aucun bloc pertinent n'a été trouvé dans tout le fichier
             if not blocks_data:
-                logger.warning(f"Aucun contenu texte pertinent (type 'text' ou 'qa' avec contenu) n'a été extrait de {json_file}, fichier ignoré.")
-                continue # Passer au fichier JSON suivant
+                logger.warning(f"Aucun contenu textuel pertinent extrait de {os.path.basename(json_file)}")
+                continue
 
-            # Concaténer tous les blocs extraits du fichier
-            full_content = "\n\n---\n\n".join(blocks_data)
+            full_content = "\n\n---\n\n".join(blocks_data) # Séparateur clair entre blocs
 
-            # Créer les métadonnées (ajuster selon les besoins)
+            # Création des métadonnées (identique à votre version)
             metadata = {
-                "source": json_file, # Chemin complet utile pour le debug
+                "source": json_file,
                 "source_file": os.path.basename(json_file),
                 "document_title": doc_meta.get("document_title"),
                 "program_name": doc_meta.get("program_name"),
-                "category": "docs_officiels", # Catégorie fixe pour cette fonction
-                "type": "knowledge_document", # Type fixe pour cette fonction
+                "category": "docs_officiels",
+                "type": "knowledge_document",
                 "date_update": global_meta.get("date_update") or doc_meta.get("date_update"),
                 "tags": doc_meta.get("tags", []),
-                "priority": doc_meta.get("priority", 100), # Priorité par défaut
+                "priority": doc_meta.get("priority", 100),
             }
-            # Nettoyer les métadonnées (supprimer clés avec valeur None ou vide)
             metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
 
-            # Créer et ajouter le Document Langchain
             docs.append(Document(page_content=full_content, metadata=metadata))
-            logger.info(f"Document créé avec succès pour {os.path.basename(json_file)} avec {len(blocks_data)} bloc(s) extrait(s).")
+            logger.info(f"Document créé pour {os.path.basename(json_file)} avec {block_count} bloc(s) textuel(s) extrait(s).")
 
-        except json.JSONDecodeError as je:
-            logger.error(f"Erreur de décodage JSON dans le fichier {json_file}: {je}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Erreur JSON dans {json_file} : {e}")
         except Exception as e:
-            # Capturer d'autres erreurs potentielles pendant le traitement du fichier
-            logger.error(f"Erreur inattendue lors du traitement du fichier JSON {json_file}: {e}", exc_info=True) # exc_info=True ajoute le traceback au log
+            logger.error(f"Erreur inattendue lors du traitement de {json_file} : {e}", exc_info=True) # Ajout traceback
 
-    logger.info(f"Chargement des documents officiels terminé. {len(docs)} documents ont été créés au total.")
+    logger.info(f"Chargement terminé. {len(docs)} documents créés au total.")
     return docs
+
 
 def load_rules_from_json(rules_path: str) -> List[Document]:
     """Charge les règles depuis des fichiers JSON."""
@@ -494,16 +680,8 @@ def load_cached_embeddings_from_dir(embeddings: Embeddings, cache_dir: str, curr
         except FileNotFoundError:
              logger.warning(f"Cache - Fichier hash ou dossier index non trouvé dans {cache_dir} (peut être normal lors du premier lancement).")
         except Exception as e:
-            # Erreur de chargement (ex: version incompatible, fichier corrompu)
             logger.error(f"Cache - Erreur lors du chargement de l'index FAISS depuis {cache_dir}: {e}", exc_info=True)
-            # Optionnel: Supprimer le cache potentiellement corrompu pour forcer la recréation
-            # import shutil
-            # try:
-            #     shutil.rmtree(faiss_index_path, ignore_errors=True)
-            #     if os.path.exists(hash_file_path): os.remove(hash_file_path)
-            #     logger.info(f"Cache corrompu supprimé pour {cache_dir}.")
-            # except OSError as oe:
-            #      logger.error(f"Erreur lors de la suppression du cache corrompu: {oe}")
+        
     else:
         logger.info(f"Cache - Cache non trouvé ou incomplet dans {cache_dir}.")
 
@@ -564,23 +742,37 @@ def create_vector_store(documents: List[Document], embeddings: Embeddings, cache
 # ================= EXTRACTION ET TRAITEMENT DES DONNÉES (pour le graphe) =================
 
 def extract_dossier_number(question: str) -> List[str]:
-    """Extrait les numéros de dossier (format XX-YYYY ou XX YYYY) de la question."""
-    # Pattern pour XX-YYYY ou XX YYYY, potentiellement précédé de "dossier", "n°", etc.
-    patterns = [
-        r'\b(\d{2}[-\s]\d{4})\b',  # Format isolé
-        r'(?:dossier|cas|référence)\s*(?:n°|numéro|numero|n|°|:)?\s*(\d{2}[-\s]\d{4})\b' # Précédé d'un mot clé
-    ]
+    """
+    Extrait les numéros de dossier (formats XX-XX, XX-XXX, XX-XXXX avec
+    séparateur '-' ou ' ') de la question. Normalise au format XX-YY[YY].
+    """
+    pattern = r'\b(\d{2}[-\s]\d{2,4})\b'
+
+    # Trouver toutes les correspondances non chevauchantes, insensible à la casse
+    matches = re.findall(pattern, question, re.IGNORECASE)
+
     results = []
-    for pattern in patterns:
-        matches = re.findall(pattern, question, re.IGNORECASE)
-        for match in matches:
-            # Normaliser au format XX-YYYY et supprimer les doublons
-            normalized_match = re.sub(r'\s', '-', match).strip()
-            if normalized_match not in results:
-                results.append(normalized_match)
+    seen = set() # Utiliser un set pour une déduplication efficace
+    for match in matches:
+        # Normaliser le séparateur en tiret
+        normalized_match = re.sub(r'\s', '-', match).strip()
+        # Ajouter à la liste si ce n'est pas un doublon
+        if normalized_match not in seen:
+            results.append(normalized_match)
+            seen.add(normalized_match)
 
     if results:
-         logger.info(f"Numéros de dossier potentiels extraits de la question: {results}")
+         # Utiliser logger.info si logger est disponible et configuré
+         try:
+             logger.info(f"Numéros de dossier potentiels extraits de la question: {results}")
+         except NameError: # Gérer le cas où logger n'est pas défini globalement
+             print(f"INFO: Numéros de dossier potentiels extraits de la question: {results}") 
+    else:
+         try:
+            logger.debug(f"Aucun numéro de dossier correspondant aux formats (XX-XX[XX]) trouvé dans: '{question[:100]}...'")
+         except NameError:
+            pass # Ne rien afficher si aucun numéro trouvé et pas de logger
+
     return results
 
 def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]:
@@ -594,7 +786,7 @@ def db_resultats_to_documents(resultats: List[Dict[str, Any]]) -> List[Document]
         # Formatage du contenu pour lisibilité
         content_parts = [f"**Informations Dossier BDD {resultat.get('Numero', 'N/A')} (Résultat {i+1})**"]
         for key, value in resultat.items():
-             # Formater les dates si présentes
+             # Formate les dates si présentes
              if isinstance(value, date):
                  value_str = value.strftime('%d/%m/%Y')
              else:
@@ -639,7 +831,6 @@ def search_database(state: State) -> Dict[str, Any]:
 
     if dossier_numbers:
         # Stratégie actuelle: rechercher le premier numéro trouvé.
-        # Pourrait être modifié pour rechercher tous les numéros ou utiliser d'autres termes.
         num_to_search = dossier_numbers[0]
         logger.info(f"Tentative de recherche BDD pour le numéro: {num_to_search}")
         try:
@@ -673,8 +864,7 @@ def retrieve(state: State) -> Dict[str, Any]:
             logger.debug(f"Recherche Règles pour: '{question[:50]}...'")
             relevant_rules = rules_vector_store.similarity_search(question, k=3)
             logger.info(f"Retrieve - {len(relevant_rules)} règles récupérées.")
-            # Vérifier/forcer les métadonnées si nécessaire (normalement déjà fait au chargement)
-            # for doc in relevant_rules: doc.metadata['category'] = 'regles'; doc.metadata['type'] = 'rule_document'
+           
         except Exception as e:
             logger.error(f"Retrieve - Erreur recherche rules_vector_store: {e}", exc_info=True)
     else:
@@ -708,7 +898,7 @@ def retrieve(state: State) -> Dict[str, Any]:
                 f"(BDD: {len(db_docs)}, Règles: {len(relevant_rules)}, "
                 f"Officiels: {len(relevant_official_docs)}, Echanges: {len(relevant_echanges)})")
 
-    # 6. Déduplication simple basée sur le contenu exact (peut être affinée si nécessaire)
+    # 6. Déduplication simple basée sur le contenu exact 
     seen_content = set()
     unique_docs = []
     for doc in combined_docs:
@@ -795,7 +985,7 @@ def generate(state: State) -> Dict[str, Any]:
     # Formater la liste des sources pour référence
     formatted_sources_list = "\n".join([f"- [{d['id']}] {d['file']} (Cat: {d['category']}, Type: {d['type']})" for d in docs_details_list])
 
-    # Instructions Système (adaptées de votre version précédente)
+    # Instructions Système 
     system_instructions = (
         "Tu es un assistant expert spécialisé dans le dispositif KAP Numérique, conçu pour aider les agents instructeurs.\n"
         "Ta mission est de fournir des réponses précises, structurées et professionnelles basées **exclusivement** sur les informations fournies dans le contexte.\n\n"
@@ -836,7 +1026,6 @@ def generate(state: State) -> Dict[str, Any]:
     )
 
     logger.info(f"Génération - Prompt final préparé (longueur approx: {len(user_prompt)} chars). Appel du LLM...")
-    # logger.debug(f"--- SYSTEM PROMPT ---\n{system_instructions}\n--- USER PROMPT ---\n{user_prompt[:2000]}...") # Tronquer pour le debug
 
     # Appel du modèle LLM
     try:
@@ -846,13 +1035,12 @@ def generate(state: State) -> Dict[str, Any]:
         ]
         response = llm.invoke(
             messages,
-            # Options de génération peuvent être ajoutées ici si nécessaire
-            # temperature=0.1,
-            # max_tokens=2000
+            # Options de génération de réponse
+             temperature=0.1,
+             max_tokens=2000
             )
         final_answer = response.content
         logger.info("Génération - Réponse reçue du LLM.")
-        # logger.debug(f"Réponse brute du LLM: {final_answer}")
         return {"answer": final_answer}
 
     except Exception as e:
@@ -866,7 +1054,7 @@ def build_graph() -> StateGraph:
     logger.info("Construction du graphe RAG...")
     workflow = StateGraph(State)
 
-    # Ajout des noeuds (fonctions définies précédemment)
+    # Ajout des noeuds 
     workflow.add_node("search_database", search_database)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("generate", generate)
@@ -896,23 +1084,24 @@ def init_rag_system() -> Dict[str, Any]:
 
     logger.info("="*20 + " Initialisation du Système RAG " + "="*20)
 
-    # Initialisation du dictionnaire status SANS la clé "graph" pour l'instant
     status = {
         "embeddings_ok": False, "llm_ok": False, "db_ok": False,
         "rules_store_ok": False, "official_docs_store_ok": False, "echanges_store_ok": False,
         "graph_ok": False,
         "counts": {"rules": 0, "official": 0, "echanges": 0, "rules_splits": 0, "official_splits": 0, "echanges_splits": 0},
-        # "graph": graph, # <--- SUPPRIMER CETTE LIGNE ICI
         "search_function": None,
         "error_messages": []
     }
-    # Initialiser la variable locale graph à None
-    graph = None # <--- AJOUTER CECI
+   
+    graph = None
 
     # 1. Initialiser Embeddings
     try:
-        embeddings = MistralAIEmbeddings()
-        logger.info(f"Embeddings initialisés: {type(embeddings).__name__}")
+        #embeddings = MistralAIEmbeddings()
+        #embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")    
+                    
+        logger.info(f"Embeddings initialisés avec succés")
         status["embeddings_ok"] = True
     except Exception as e:
         logger.error(f"Échec initialisation Embeddings: {e}", exc_info=True)
@@ -921,7 +1110,8 @@ def init_rag_system() -> Dict[str, Any]:
 
     # 2. Initialiser LLM
     try:
-        llm = ChatMistralAI(model="mistral-large-latest", temperature=0.1)
+        #llm = ChatMistralAI(model="mistral-large-latest")
+        llm = ChatOpenAI(model="gpt-4o") 
         logger.info(f"LLM initialisé: {type(llm).__name__} (Model: {getattr(llm, 'model', 'N/A')})")
         status["llm_ok"] = True
     except Exception as e:
@@ -932,11 +1122,10 @@ def init_rag_system() -> Dict[str, Any]:
     if not status["embeddings_ok"] or not status["llm_ok"]:
         logger.critical("Arrêt de l'initialisation: Embeddings ou LLM manquants.")
         # AJOUTER la clé graph (avec la valeur None) au status avant de retourner
-        status["graph"] = graph # <--- Assurer que la clé existe même en cas d'échec précoce
+        status["graph"] = graph 
         return status
 
     # 3. Initialiser et tester la connexion DB
-    # (Code DB inchangé...)
     try:
         db_manager = DatabaseManager()
         if db_manager._is_config_valid(): # Vérifier si la config est là avant de tester
@@ -963,7 +1152,6 @@ def init_rag_system() -> Dict[str, Any]:
 
 
     # 4. Charger tous les documents
-    # (Code load_all_documents inchangé...)
     official_docs, echanges_docs, rules_docs = load_all_documents()
     status["counts"]["official"] = len(official_docs)
     status["counts"]["echanges"] = len(echanges_docs)
@@ -971,9 +1159,8 @@ def init_rag_system() -> Dict[str, Any]:
 
 
     # 5. Découper les documents
-    # (Code splitters inchangé...)
-    general_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, add_start_index=True)
-    rules_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100, add_start_index=True) # Plus petit pour règles
+    general_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=512, add_start_index=True)
+    rules_splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=512, add_start_index=True) # Plus petit pour règles
 
     official_splits = general_splitter.split_documents(official_docs) if official_docs else []
     echanges_splits = general_splitter.split_documents(echanges_docs) if echanges_docs else []
@@ -985,7 +1172,6 @@ def init_rag_system() -> Dict[str, Any]:
 
 
     # 6. Créer/Charger les Vector Stores
-    # (Code create_vector_store inchangé...)
     rules_store_cache_dir = os.path.join(CACHE_DIR, "rules_store")
     official_docs_store_cache_dir = os.path.join(CACHE_DIR, "official_docs_store")
     echanges_store_cache_dir = os.path.join(CACHE_DIR, "echanges_store")
@@ -1002,11 +1188,9 @@ def init_rag_system() -> Dict[str, Any]:
     status["echanges_store_ok"] = echanges_vector_store is not None
     if not status["echanges_store_ok"]: status["error_messages"].append("VectorStore Echanges: Échec création/chargement")
 
-    # 7. Construire le graphe (assignation à la variable locale 'graph')
+    # 7. Construire le graphe 
     try:
-        # Assigner à la variable locale 'graph' initialisée plus haut
         graph = build_graph()
-        # La clé "graph" n'est plus dans status ici, on l'ajoutera après
         status["graph_ok"] = True
         logger.info("Graphe RAG final prêt.")
     except Exception as e:
@@ -1015,9 +1199,7 @@ def init_rag_system() -> Dict[str, Any]:
         status["graph_ok"] = False
         graph = None # Assurer que graph est None si la construction échoue
 
-    # AJOUTER la clé "graph" au dictionnaire status MAINTENANT,
-    # après la tentative de construction. Sa valeur sera soit l'objet graphe, soit None.
-    status["graph"] = graph # <--- AJOUTER LA CLÉ ICI
+    status["graph"] = graph 
 
     logger.info("="*20 + " Fin Initialisation Système RAG " + "="*20)
 
@@ -1028,10 +1210,3 @@ def init_rag_system() -> Dict[str, Any]:
 
 # --- Fin de la fonction init_rag_system ---
 
-# Initialiser le système RAG
-rag_system_status = init_rag_system()
-
-# Mettre à jour la variable globale graph pour qu'elle soit visible partout
-# ATTENTION: Renommer la variable globale pour éviter confusion, ou ne pas utiliser de globale ici
-# Option 1: Ne pas utiliser de variable globale 'graph' en dehors de tests simples
-app_graph = rag_system_status.get("graph") # Récupère le graphe depuis le statut retourné
