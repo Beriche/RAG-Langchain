@@ -1,5 +1,3 @@
-# src/document_processor.py
-
 import os
 import json
 import glob
@@ -9,6 +7,8 @@ from typing import List, Dict, Any, Tuple
 from langchain_core.documents import Document
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.document_loaders import PyPDFLoader
 
 logger = logging.getLogger(__name__)
 
@@ -379,3 +379,44 @@ def split_documents(documents: List[Document], chunk_size: int, chunk_overlap: i
     splits = splitter.split_documents(documents)
     logger.info(f"{len(documents)} documents découpés en {len(splits)} chunks (size: {chunk_size}, overlap: {chunk_overlap}).")
     return splits
+
+
+
+def load_user_uploaded_documents(user_uploads_path: str) -> List[Document]:
+    docs: List[Document] = []
+    if not os.path.isdir(user_uploads_path):
+        logger.warning(f"Répertoire des uploads utilisateur non trouvé: {user_uploads_path}")
+        return docs
+
+    # Chargement des TXT
+    txt_loader = DirectoryLoader(
+        user_uploads_path, glob="**/*.txt", loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"}, recursive=True,
+        show_progress=False, use_multithreading=False, # Simplifier pour moins de fichiers
+    )
+    loaded_txt = txt_loader.load()
+    for doc in loaded_txt:
+        doc.metadata["category"] = "user_uploaded"
+        doc.metadata["type"] = "user_document"
+        doc.metadata["source_file"] = os.path.basename(doc.metadata.get("source", "inconnu.txt"))
+    docs.extend(loaded_txt)
+    logger.info(f"{len(loaded_txt)} fichiers TXT chargés depuis les uploads utilisateur.")
+
+    # Chargement des PDF
+    pdf_files = glob.glob(os.path.join(user_uploads_path, "*.pdf"))
+    for pdf_file in pdf_files:
+        try:
+            loader = PyPDFLoader(pdf_file)
+            pdf_pages = loader.load_and_split() # PyPDFLoader charge et split déjà
+            for page_doc in pdf_pages: # Chaque page est un Document
+                page_doc.metadata["category"] = "user_uploaded"
+                page_doc.metadata["type"] = "user_document"
+                page_doc.metadata["source_file"] = os.path.basename(pdf_file)
+                page_doc.metadata["source"] = pdf_file # Garder le chemin complet
+            docs.extend(pdf_pages)
+            logger.info(f"Fichier PDF chargé et splitté: {pdf_file} ({len(pdf_pages)} pages)")
+        except Exception as e:
+            logger.error(f"Erreur chargement PDF {pdf_file}: {e}")
+    
+    logger.info(f"Total {len(docs)} documents chargés depuis les uploads utilisateur.")
+    return docs

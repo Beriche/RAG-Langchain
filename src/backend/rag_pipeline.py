@@ -106,7 +106,8 @@ def retrieve(
     state: State,
     rules_vectore_store: Optional[VectorStore],
     official_vectore_store: Optional[VectorStore],
-    echanges_vectore_store: Optional[VectorStore]
+    echanges_vectore_store: Optional[VectorStore],
+    user_vectore_store: Optional[VectorStore]
 ) -> Dict[str, Any]:
     """Noeud: Récupère documents depuis BDD (via state) et vector stores (via dépendances)."""
     logger.info("Noeud: retrieve")
@@ -114,7 +115,20 @@ def retrieve(
     db_docs = db_resultats_to_documents(state.get("db_results", []))
     
     relevant_rules, relevant_official_docs, relevant_echanges = [], [], []
-
+    relevant_user_docs = []
+    
+    # 1. Recupere les documents envoyé par l'utilisateur 
+    if user_vectore_store:
+        try:
+            # Tu peux ajuster la priorité ici ou la manière dont les documents sont ajoutés
+            # Par exemple, leur donner une priorité similaire aux documents officiels.
+            relevant_user_docs = user_vectore_store.similarity_search(state["question"], k=3) # Ajuster k
+            logger.info(f"Retrieve - {len(relevant_user_docs)} documents utilisateur trouvés.")
+        except Exception as e:
+            logger.error(f"Retrieve - Erreur lors de la recherche dans user_vector_store: {e}", exc_info=True)
+    else:
+        logger.warning("Retrieve - user_vector_store non disponible pour la recherche.")
+        
     # 2. Interroger le Vector Store des Règles (k faible, haute pertinence attendue)
     if rules_vectore_store:
         try:
@@ -139,7 +153,8 @@ def retrieve(
     else: logger.warning("Retrieve - echanges_vector_store non disponible.")
 
      # 5. Combiner les résultats dans l'ordre de priorité pour le LLM: BDD > Règles > Officiels > Échanges
-    combined_docs = db_docs + relevant_rules + relevant_official_docs + relevant_echanges
+    combined_docs = db_docs + relevant_rules + relevant_official_docs +  relevant_user_docs + relevant_echanges
+    
     logger.info(f"Retrieve - Documents combinés avant déduplication: {len(combined_docs)} "
                 f"(BDD: {len(db_docs)}, Règles: {len(relevant_rules)}, "
                 f"Officiels: {len(relevant_official_docs)}, Echanges: {len(relevant_echanges)})")
@@ -294,7 +309,8 @@ def build_graph_with_deps(
     llm_dep: Optional[Any],     
     rules_vs_dep: Optional[VectorStore],
     official_vs_dep: Optional[VectorStore],
-    echanges_vs_dep: Optional[VectorStore]
+    echanges_vs_dep: Optional[VectorStore],
+    user_vs_dep: Optional[VectorStore]
 ) -> StateGraph: 
     """Construit et compile le graphe LangGraph en liant les dépendances."""
     logger.info("Construction du graphe RAG avec dépendances...")
@@ -302,7 +318,7 @@ def build_graph_with_deps(
 
    
     bound_search_database = partial(search_database, db_manager=db_man_dep, db_conn_status_val=db_conn_status_dep)
-    bound_retrieve = partial(retrieve,rules_vectore_store=rules_vs_dep, official_vectore_store=official_vs_dep, echanges_vectore_store=echanges_vs_dep)
+    bound_retrieve = partial(retrieve,rules_vectore_store=rules_vs_dep, official_vectore_store=official_vs_dep, echanges_vectore_store=echanges_vs_dep, user_vectore_store=user_vs_dep)
     bound_generate = partial(generate, llm_model=llm_dep)
 
     # Ajout des noeuds 
