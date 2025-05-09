@@ -11,8 +11,8 @@ from langchain_mistralai import MistralAIEmbeddings
 from langchain_openai.embeddings import OpenAIEmbeddings
 
 from .db_manager import DatabaseManager
-from .document_processor import load_all_documents, split_documents
-from .vector_store_utils import create_vector_store
+from .document_processor import load_all_documents, split_documents, load_user_uploaded_documents
+from .vector_store_utils import create_vector_store,update_user_vs_and_get_updated_graph
 from .rag_pipeline import build_graph_with_deps
 
 logger = logging.getLogger(__name__)
@@ -27,17 +27,70 @@ DATA_ROOT = os.getenv("DATA_ROOT", DATA_ROOT_DEFAULT)
 ECHANGES_PATH = os.path.join(DATA_ROOT, "echanges")
 REGLES_PATH = os.path.join(DATA_ROOT, "regles")
 OFFICIAL_DOCS_PATH = os.path.join(DATA_ROOT, "docs_officiels")
+USER_UPLOADS_PATH = os.path.join(DATA_ROOT, "user_uploads")
 CACHE_DIR = os.getenv("CACHE_DIR", CACHE_DIR_DEFAULT) # Où les FAISS index sont sauvegardés
-
+USER_VS_CACHE_DIR = os.path.join(CACHE_DIR, "user_docs_store")
 
 #Variables globale
 rules_vector_store: Optional[VectorStore] = None
 official_docs_vector_store: Optional[VectorStore] = None
 echanges_vector_store: Optional[VectorStore] = None
+user_docs_vector_store: Optional[VectorStore] = None
+
 llm: Optional[Any] = None
 embeddings: Optional[Embeddings] = None
 db_connected: bool = False
 db_manager: Optional[DatabaseManager] = None
+
+
+def trigger_user_vs_and_graph_update_from_rag_main() -> bool:
+    global user_docs_vector_store, llm, embeddings, db_manager, db_connected
+    global rules_vector_store, official_docs_vector_store, echanges_vector_store
+    # Import Streamlit ici seulement pour la mise à jour de session_state, si on garde cette logique ici
+    # Sinon, cette partie devrait être gérée par app.py après le retour de cette fonction.
+    # Pour la simplicité de l'appel depuis app.py, on peut le garder ici pour l'instant.
+    import streamlit as st # Attention, cela couple un peu rag_main à Streamlit
+
+    if not embeddings: # Vérification essentielle
+        logger.error("Embeddings non initialisés. Mise à jour annulée.")
+        if 'rag_components' in st.session_state and st.session_state.rag_components:
+            st.session_state.rag_components["user_docs_store_ok"] = False
+        return False
+
+    new_vs, new_graph, success = update_user_vs_and_get_updated_graph(
+        embeddings_instance=embeddings,
+        llm_instance=llm,
+        db_manager_instance=db_manager,
+        db_connection_status=db_connected,
+        rules_vs_instance=rules_vector_store,
+        official_vs_instance=official_docs_vector_store,
+        echanges_vs_instance=echanges_vector_store,
+        user_uploads_path=USER_UPLOADS_PATH,
+        user_vs_cache_path=USER_VS_CACHE_DIR,
+        current_user_vs=user_docs_vector_store
+    )
+
+    if success and new_vs is not None and new_graph is not None:
+        user_docs_vector_store = new_vs # Mettre à jour la globale
+        logger.info("Global user_docs_vector_store mis à jour.")
+        
+        # Mettre à jour le graphe dans st.session_state
+        # Cela suppose que init_rag_system a déjà peuplé rag_components
+        if 'rag_components' in st.session_state and st.session_state.rag_components:
+            st.session_state.rag_components["graph"] = new_graph
+            st.session_state.rag_components["user_docs_store_ok"] = True
+            logger.info("Graphe RAG dans st.session_state mis à jour.")
+        else:
+            logger.warning("st.session_state.rag_components non trouvé pour la mise à jour du graphe.")
+        return True
+    else:
+        logger.error("Échec de la mise à jour du VS utilisateur ou du graphe depuis vector_store_utils.")
+        if 'rag_components' in st.session_state and st.session_state.rag_components:
+            st.session_state.rag_components["user_docs_store_ok"] = False
+        # Potentiellement mettre à jour user_docs_vector_store avec new_vs même si le graphe a échoué
+        if new_vs is not None:
+            user_docs_vector_store = new_vs
+        return False
 
 def init_rag_system() -> Dict[str, Any]:
     """Initialise tous les composants du système RAG (LLM, Embeddings, DB, Vector Stores, Graphe).
@@ -45,16 +98,18 @@ def init_rag_system() -> Dict[str, Any]:
     
     # Utiliser les variables globales pour stocker les objets initialisés
     global llm, embeddings, db_manager, db_connected
-    global rules_vector_store, official_docs_vector_store, echanges_vector_store
+    global rules_vector_store, official_docs_vector_store, echanges_vector_store , user_docs_vector_store
 
     logger.info("="*20 + " Initialisation du Système RAG " + "="*20)
     status = {
         "embeddings_ok": False, "llm_ok": False, "db_ok": False,
         "rules_store_ok": False, "official_docs_store_ok": False, "echanges_store_ok": False,
+        "user_docs_store_ok": False,
         "graph_ok": False,
         "counts": {"rules": 0, "official": 0, "echanges": 0, "rules_splits": 0, "official_splits": 0, "echanges_splits": 0},
         "search_function": None, 
         "get_distinct_values_function": None, 
+        "update_user_vector_store":trigger_user_vs_and_graph_update_from_rag_main,
         "error_messages": []
     }
     graph = None 
@@ -153,6 +208,20 @@ def init_rag_system() -> Dict[str, Any]:
     echanges_vector_store = create_vector_store(echanges_splits, embeddings, echanges_store_cache_dir)
     status["echanges_store_ok"] = echanges_vector_store is not None
     if not status["echanges_store_ok"]: status["error_messages"].append("VectorStore Echanges: Échec création/chargement")
+    
+    # Initialisation du Vector Store utilisateur au démarrage
+    logger.info(f"Chargement initial des documents utilisateur depuis {USER_UPLOADS_PATH}")
+    os.makedirs(USER_UPLOADS_PATH, exist_ok=True)
+    user_docs = load_user_uploaded_documents(USER_UPLOADS_PATH) # Utilise la fonction de document_processor
+    status["counts"]["user_uploaded"] = len(user_docs)
+    user_splits = split_documents(user_docs, chunk_size=800, chunk_overlap=512)
+    status["counts"]["user_uploaded_splits"] = len(user_splits)
+
+    # Utilise create_vector_store de vector_store_utils.py
+    user_docs_vector_store = create_vector_store(user_splits, embeddings, USER_VS_CACHE_DIR)
+    status["user_docs_store_ok"] = user_docs_vector_store is not None
+    if not status["user_docs_store_ok"]:
+        status["error_messages"].append("VectorStore Utilisateur: Échec création/chargement initial")
 
     # 7. Construire le graphe en passant les dépendances initialisées
     try:
@@ -162,7 +231,8 @@ def init_rag_system() -> Dict[str, Any]:
             llm_dep=llm,
             rules_vs_dep=rules_vector_store,
             official_vs_dep=official_docs_vector_store,
-            echanges_vs_dep=echanges_vector_store
+            echanges_vs_dep=echanges_vector_store,
+            user_vs_dep=user_docs_vector_store
         )
         status["graph_ok"] = True
         logger.info("Graphe RAG final prêt.")
