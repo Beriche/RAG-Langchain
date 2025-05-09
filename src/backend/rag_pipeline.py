@@ -18,6 +18,7 @@ class State(Dict):
     context: List[Document]
     db_results: List[Dict[str, Any]]
     answer: str
+    history: List[Dict[str, str]]
 
 #Extraction du numéro de dossier depuis le prompt user s'il en existe
 def extract_dossier_number(question: str) -> List[str]:
@@ -162,7 +163,8 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
     logger.info("Noeud: generate")
     question = state["question"]
     context_docs = state.get("context", [])
-
+    chat_history = state.get("history", [])
+    
     if llm_model is None:
         logger.error("Génération impossible: LLM  non initialisé.")
         return {"answer": "Erreur: Service de génération non disponible."}
@@ -213,11 +215,19 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
     
     # Formater la liste des sources pour la référence
     formatted_sources_list = "\n".join([f"- [{d['id']}] {d['file']} (Cat: {d['category']}, Type: {d['type']})" for d in docs_details_list])
+    
+    # Formatage de l'historique pour le prompt
+    formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+   
 
     # Instructions Système 
     system_instructions = (
         "Tu es un assistant expert spécialisé dans le dispositif du KAP Numérique, tu es conçu pour aider les agents instructeurs.\n"
         "Ta mission est de fournir des réponses précises, structurées et professionnelles basées **exclusivement** sur les informations fournies dans le contexte. Pas d'hallucination\n\n"
+        
+        "**GESTION DE L'HISTORIQUE ET QUESTIONS DE SUIVI/CLARIFICATION:**\n"
+        " - Utilise l'historique des conversations fourni ('Historique de la conversation') pour comprendre le contexte des questions de suivi. Par exemple, si la question précédente concernait un dossier spécifique, une question comme 'Quel est son statut ?' se réfère à ce dossier.\n"
+        " - Si une question de l'utilisateur est vague ou manque d'informations cruciales pour fournir une réponse précise (ex: 'Suis-je éligible ?' sans détails sur l'entreprise), tu DOIS poser une question de clarification ciblée pour obtenir les informations manquantes (ex: 'Pourriez-vous préciser votre secteur d'activité ou fournir votre code APE ?', 'De quel dispositif parlez-vous ?'). Ne réponds pas vaguement si tu peux demander une précision.\n"
         
         "**RÈGLES IMPÉRATIVES POUR LA GÉNÉRATION DE RÉPONSE:**\n"
         "**HIÉRARCHIE STRICTE DES SOURCES:** Analyse le contexte en respectant l'ordre de priorité suivant:\n"
@@ -253,6 +263,7 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
     
       # Construction de l'invite utilisateur
     user_prompt = (
+        f"**Historique de la conversation (pour contexte uniquement):**\n{formatted_history}\n\n"
         f"**Question de l'Agent Instructeur:**\n{question}\n\n"
         f"**Contexte Fourni (analyser en respectant la hiérarchie indiquée dans les instructions système):**\n"
         f"---\n{context_string_for_prompt}\n---\n\n"
