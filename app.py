@@ -1,3 +1,4 @@
+from huggingface_hub import upload_file
 import streamlit as st
 import os
 import time
@@ -5,12 +6,20 @@ import pandas as pd
 import logging
 import json
 
+from dotenv import load_dotenv
 from src.backend.rag_main import init_rag_system as init_rag_backend
 from src.frontend.styles import CSS_STYLES, FOOTER_HTML
 from src.frontend.components import (
     display_dossier_details_enhanced,
     display_dossier_summary,
 )
+
+load_dotenv()
+# Définition plus robuste de DATA_ROOT pour app.py
+# En supposant que app.py est à la racine du projet.
+_PROJECT_ROOT_APP = os.path.abspath(os.path.dirname(__file__))
+DATA_ROOT_APP_DEFAULT = os.path.join(_PROJECT_ROOT_APP, "data")
+DATA_ROOT = os.getenv("DATA_ROOT", DATA_ROOT_APP_DEFAULT)
 
 # --- Configuration du Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -234,6 +243,50 @@ with st.sidebar:
         if st.button("❌ Effacer Erreur", key="clear_err_btn"):
             st.session_state.error_message = None
             st.rerun()
+            
+            
+    #gestion ajout de nouveaux source de connaissance 
+    with st.sidebar.expander("📤 Gestion des Connaissances",expanded=False):
+        uploaded_files = st.file_uploader(
+            "Ajouter des documents (PDF,TXT)",
+            type=["pdf","txt"], 
+            accept_multiple_files=True,
+            key="file_uploader"
+        )
+        
+        
+        
+        if uploaded_files:
+            if st.button("Traiter les fichiers uploadés",key="process_uploads_btn"):
+            
+                st.success(f"{len(uploaded_files)} fichier(s) pris en compte. Reconstruction de la base utilisateur en cours...") 
+                
+                USER_UPLOADS_PATH = os.path.join(DATA_ROOT, "user_uploads") # Ou DATA_ROOT
+                os.makedirs(USER_UPLOADS_PATH, exist_ok=True)
+                
+                saved_files_paths = []
+                for uploaded_file in uploaded_files:
+                    file_path = os.path.join(USER_UPLOADS_PATH,uploaded_file.name)
+                    
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                        saved_files_paths.append(file_path)
+                        logger.info(f"Fichier sauvegardé: {file_path}")
+                
+                # Appeler une fonction pour (re)construire le vector store utilisateur
+                if st.session_state.rag_components and callable(st.session_state.rag_components.get("update_user_vector_store")):
+                    update_usepyr_vs_func = st.session_state.rag_components.get("update_user_vector_store")
+                    
+                    with st.spinner("Mise à jour de la base de connaissance utilisateur..."):
+                        success_update = update_user_vs_func()
+                        
+                    if success_update:
+                        st.success("Base de connaissance utilisateur mise à jour ! ")
+                    else:
+                        st.error("Erreur lors de la mise à jour ! ")
+                else:
+                    st.error("Fonction de mise à jour du vector store utilisteur non disponible.")
+                    
 
 # --- Zone Principale ---
 st.title("🤖 Assistant KAP Numérique")

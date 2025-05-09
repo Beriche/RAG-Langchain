@@ -1,14 +1,15 @@
-# src/vector_store_utils.py
-
 import os
 import hashlib
 import logging
-from typing import List, Optional
+from typing import List, Optional, Any, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langchain_community.vectorstores import FAISS
+
+from .document_processor import load_user_uploaded_documents, split_documents 
+from .rag_pipeline import build_graph_with_deps 
 
 logger = logging.getLogger(__name__)
 
@@ -91,3 +92,71 @@ def create_vector_store(documents: List[Document], embeddings: Embeddings, cache
     except Exception as e:
         logger.error(f"Erreur critique lors de la création de l'index FAISS pour {cache_dir}: {e}", exc_info=True)
         return None
+    
+def update_user_vs_and_get_updated_graph(
+    embeddings_instance: Embeddings,
+    llm_instance: Any,
+    db_manager_instance: Optional[Any],
+    db_connection_status: bool,
+    rules_vs_instance: Optional[VectorStore],
+    official_vs_instance: Optional[VectorStore],
+    echanges_vs_instance: Optional[VectorStore],
+    user_uploads_path: str,
+    user_vs_cache_path: str,
+    current_user_vs: Optional[VectorStore] 
+) -> Tuple[Optional[VectorStore], Optional[Any], bool]:
+    """
+    Met à jour le VectorStore des documents utilisateur et reconstruit le graphe RAG.
+    Retourne le nouveau VectorStore utilisateur, le nouveau graphe, et un booléen de succès.
+    """
+    logger.info(f"Début de la mise à jour du VectorStore utilisateur et du graphe RAG via {user_uploads_path}")
+
+    if not embeddings_instance:
+        logger.error("Embeddings non fournis. Impossible de mettre à jour le VectorStore utilisateur.")
+        return current_user_vs, None, False # Retourne le VS actuel et pas de nouveau graphe
+
+    new_user_vector_store: Optional[VectorStore] = None
+    new_graph: Optional[Any] = None
+    success_flag = False
+
+    try:
+        # 1. Charger et splitter les documents utilisateur
+        os.makedirs(user_uploads_path, exist_ok=True) # S'assurer que le dossier existe
+        user_docs = load_user_uploaded_documents(user_uploads_path)
+        user_splits = split_documents(user_docs, chunk_size=800, chunk_overlap=512) # Adapte si besoin
+
+        # 2. Créer/Mettre à jour le VectorStore utilisateur
+        # create_vector_store gère déjà le cache
+        new_user_vector_store = create_vector_store(user_splits, embeddings_instance, user_vs_cache_path)
+
+        if new_user_vector_store is None:
+            logger.error("Échec de la création/mise à jour du user_docs_vector_store.")
+            return current_user_vs, None, False
+
+        logger.info(f"VectorStore utilisateur mis à jour avec {len(user_splits)} chunks.")
+
+        # 3. Reconstruire le graphe RAG avec le nouveau VectorStore utilisateur
+        # Note: Tous les autres VectorStores et composants LLM/DB doivent être passés
+        if not llm_instance:
+            logger.error("Instance LLM non fournie. Impossible de reconstruire le graphe.")
+            return new_user_vector_store, None, False # Retourne le VS mis à jour mais pas de graphe
+
+        logger.info("Reconstruction du graphe RAG avec le VectorStore utilisateur mis à jour...")
+        new_graph = build_graph_with_deps(
+            db_man_dep=db_manager_instance,
+            db_conn_status_dep=db_connection_status,
+            llm_dep=llm_instance,
+            rules_vs_dep=rules_vs_instance,
+            official_vs_dep=official_vs_instance,
+            echanges_vs_dep=echanges_vs_instance,
+            user_vs_dep=new_user_vector_store  # Utilise le VS utilisateur fraîchement créé/mis à jour
+        )
+        logger.info("Graphe RAG reconstruit avec succès.")
+        success_flag = True
+
+    except Exception as e:
+        logger.error(f"Erreur critique lors de la mise à jour du VS utilisateur et/ou du graphe : {e}", exc_info=True)
+        # Retourne le nouveau VS s'il a été créé, sinon l'ancien, et pas de nouveau graphe
+        return new_user_vector_store if new_user_vector_store else current_user_vs, None, False
+
+    return new_user_vector_store, new_graph, success_flag

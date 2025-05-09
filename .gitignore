@@ -1,3 +1,6 @@
 .env
 .venv
-data 
+data
+cache_embeddings
+cache 
+__pycache__
