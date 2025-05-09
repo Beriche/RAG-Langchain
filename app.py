@@ -150,7 +150,7 @@ def process_user_query(query: str) -> str:
         initial_state = {
             "question": query,
             "context": [], "db_results": [], "answer": "",
-            "history": st.session_state.chat_history[-5:]
+            "history": st.session_state.chat_history[-5:] # récupere les 5 dernier message, pour garder le context
         }
         
         start_time = time.time()
