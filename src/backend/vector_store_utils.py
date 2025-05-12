@@ -123,7 +123,7 @@ def update_user_vs_and_get_updated_graph(
         # 1. Charger et splitter les documents utilisateur
         os.makedirs(user_uploads_path, exist_ok=True) # S'assurer que le dossier existe
         user_docs = load_user_uploaded_documents(user_uploads_path)
-        user_splits = split_documents(user_docs, chunk_size=800, chunk_overlap=512) # Adapte si besoin
+        user_splits = split_documents(user_docs, chunk_size=512, chunk_overlap=200) 
 
         # 2. Créer/Mettre à jour le VectorStore utilisateur
         # create_vector_store gère déjà le cache

@@ -182,9 +182,10 @@ def init_rag_system() -> Dict[str, Any]:
 
 
     # 5. Découper les documents
-    official_splits = split_documents(official_docs, chunk_size=800, chunk_overlap=512)
+    official_splits = split_documents(official_docs, chunk_size=600, chunk_overlap=300)
     echanges_splits = split_documents(echanges_docs, chunk_size=800, chunk_overlap=512)
-    rules_splits = split_documents(rules_docs, chunk_size=700, chunk_overlap=512)# Plus petit pour règles
+    rules_splits = split_documents(rules_docs, chunk_size=512, chunk_overlap=200)# Plus petit pour règles
+   
   
     status["counts"]["official_splits"] = len(official_splits)
     status["counts"]["echanges_splits"] = len(echanges_splits)
@@ -214,7 +215,7 @@ def init_rag_system() -> Dict[str, Any]:
     os.makedirs(USER_UPLOADS_PATH, exist_ok=True)
     user_docs = load_user_uploaded_documents(USER_UPLOADS_PATH) # Utilise la fonction de document_processor
     status["counts"]["user_uploaded"] = len(user_docs)
-    user_splits = split_documents(user_docs, chunk_size=800, chunk_overlap=512)
+    user_splits = split_documents(user_docs, chunk_size=512, chunk_overlap=200)
     status["counts"]["user_uploaded_splits"] = len(user_splits)
 
     # Utilise create_vector_store de vector_store_utils.py

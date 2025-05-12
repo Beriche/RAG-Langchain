@@ -49,7 +49,7 @@ def init_session_state_vars():
         'chat_history': [],
         'is_processing': False,
         'rag_components': None,
-        'sources_table_expanded': True, 
+        'sources_table_expanded': False, 
         'show_sources': True, 
         'show_db_results': True,
         'last_result': None,
