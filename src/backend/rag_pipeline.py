@@ -2,12 +2,21 @@ import os
 import re
 import logging
 from datetime import date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from langchain_core.documents import Document
-from langchain_core.vectorstores import VectorStore 
+from langchain_core.vectorstores import VectorStore
 from langgraph.graph import StateGraph, END, START
-from functools import partial 
+from functools import partial
+from langchain.retrievers import EnsembleRetriever # Ajout pour EnsembleRetriever
+from rank_bm25 import BM25Okapi # Pour type hinting
+import concurrent.futures # Ajout pour la parallélisation
+
+# Import des utilitaires BM25 et du retriever personnalisé
+from .bm25_utils import BM25Retriever 
+
+# Type hint pour les composants BM25 (BM25Okapi, List[Document])
+BM25Components = Optional[Tuple[BM25Okapi, List[Document]]]
 
 
 logger = logging.getLogger(__name__)
@@ -104,62 +113,126 @@ def search_database(state: State, db_manager: Optional[Any], db_conn_status_val:
 
 def retrieve(
     state: State,
-    rules_vectore_store: Optional[VectorStore],
-    official_vectore_store: Optional[VectorStore],
-    echanges_vectore_store: Optional[VectorStore],
-    user_vectore_store: Optional[VectorStore]
+    # FAISS VectorStores
+    rules_vs: Optional[VectorStore],
+    official_vs: Optional[VectorStore],
+    echanges_vs: Optional[VectorStore],
+    user_vs: Optional[VectorStore],
+    # BM25 Components (BM25Okapi index, List[Document] corpus)
+    rules_bm25_comps: BM25Components,
+    official_bm25_comps: BM25Components,
+    echanges_bm25_comps: BM25Components,
+    user_bm25_comps: BM25Components,
+    # Configuration pour la recherche (k pour FAISS, k pour BM25, poids pour EnsembleRetriever)
+    k_faiss: int = 3, 
+    k_bm25: int = 3,
+    ensemble_weights: Optional[List[float]] = None, # e.g., [0.5, 0.5]
+    max_workers: int = 4 # Nombre de threads pour la parallélisation
 ) -> Dict[str, Any]:
-    """Noeud: Récupère documents depuis BDD (via state) et vector stores (via dépendances)."""
-    logger.info("Noeud: retrieve")
+    """
+    Noeud: Récupère documents depuis BDD (via state) et de manière hybride (FAISS + BM25)
+    depuis les différentes sources de documents, avec récupération parallélisée par source.
+    """
+    logger.info("Noeud: retrieve (Hybride FAISS + BM25) - Parallélisé")
     question = state["question"]
     db_docs = db_resultats_to_documents(state.get("db_results", []))
-    
-    relevant_rules, relevant_official_docs, relevant_echanges = [], [], []
-    relevant_user_docs = []
-    
-    # 1. Recupere les documents envoyé par l'utilisateur 
-    if user_vectore_store:
-        try:
-            # Tu peux ajuster la priorité ici ou la manière dont les documents sont ajoutés
-            # Par exemple, leur donner une priorité similaire aux documents officiels.
-            relevant_user_docs = user_vectore_store.similarity_search(state["question"], k=3) # Ajuster k
-            logger.info(f"Retrieve - {len(relevant_user_docs)} documents utilisateur trouvés.")
-        except Exception as e:
-            logger.error(f"Retrieve - Erreur lors de la recherche dans user_vector_store: {e}", exc_info=True)
-    else:
-        logger.warning("Retrieve - user_vector_store non disponible pour la recherche.")
+
+    if ensemble_weights is None:
+        ensemble_weights = [0.5, 0.5] # Poids par défaut si non fournis
+
+    # Fonction d'aide pour la récupération hybride par source (reste identique)
+    def get_hybrid_docs_for_source(
+        source_name: str,
+        faiss_vs: Optional[VectorStore],
+        bm25_components: BM25Components
+    ) -> Tuple[str, List[Document]]: # Retourne aussi le nom pour identifier les résultats
+        retrieved_for_source: List[Document] = []
+        faiss_retriever, bm25_retriever_custom = None, None
+
+        # ... (logique interne de get_hybrid_docs_for_source reste la même) ...
+        if faiss_vs:
+            faiss_retriever = faiss_vs.as_retriever(search_kwargs={'k': k_faiss})
         
-    # 2. Interroger le Vector Store des Règles (k faible, haute pertinence attendue)
-    if rules_vectore_store:
-        try:
-            relevant_rules = rules_vectore_store.similarity_search(question, k=3)
-            logger.info(f"Retrieve - {len(relevant_rules)} règles.")
-        except Exception as e: logger.error(f"Retrieve - Erreur recherche rules_vector_store: {e}", exc_info=True)
-    else: logger.warning("Retrieve - rules_vector_store non disponible.")
+        if bm25_components:
+            bm25_idx, bm25_docs_corpus = bm25_components
+            if bm25_idx and bm25_docs_corpus:
+                bm25_retriever_custom = BM25Retriever(bm25_index=bm25_idx, docs=bm25_docs_corpus, k=k_bm25)
+        
+        if faiss_retriever and bm25_retriever_custom:
+            logger.debug(f"Retrieve - {source_name}: Utilisation de EnsembleRetriever (FAISS + BM25).")
+            ensemble = EnsembleRetriever(
+                retrievers=[faiss_retriever, bm25_retriever_custom],
+                weights=ensemble_weights
+            )
+            try:
+                retrieved_for_source = ensemble.invoke(question)
+            except Exception as e:
+                logger.error(f"Retrieve - Erreur EnsembleRetriever pour {source_name}: {e}", exc_info=True)
+        elif faiss_retriever:
+            logger.debug(f"Retrieve - {source_name}: Utilisation de FAISS Retriever uniquement.")
+            try:
+                retrieved_for_source = faiss_retriever.invoke(question)
+            except Exception as e:
+                logger.error(f"Retrieve - Erreur FAISS Retriever pour {source_name}: {e}", exc_info=True)
+        elif bm25_retriever_custom:
+            logger.debug(f"Retrieve - {source_name}: Utilisation de BM25Retriever uniquement.")
+            try:
+                retrieved_for_source = bm25_retriever_custom.invoke(question)
+            except Exception as e:
+                logger.error(f"Retrieve - Erreur BM25Retriever pour {source_name}: {e}", exc_info=True)
+        else:
+            logger.warning(f"Retrieve - {source_name}: Aucun retriever disponible.")
+            
+        logger.info(f"Retrieve - {source_name}: {len(retrieved_for_source)} documents trouvés.")
+        return source_name, retrieved_for_source
 
-    if official_vectore_store:
-        try:
-            relevant_official_docs = official_vectore_store.similarity_search(question, k=5)
-            logger.info(f"Retrieve - {len(relevant_official_docs)} docs officiels.")
-        except Exception as e: logger.error(f"Retrieve - Erreur recherche official_docs_vector_store: {e}", exc_info=True)
-    else: logger.warning("Retrieve - official_docs_vector_store non disponible.")
+    # Définir les tâches de récupération pour chaque source
+    tasks = [
+        ("UserDocs", user_vs, user_bm25_comps),
+        ("Rules", rules_vs, rules_bm25_comps),
+        ("OfficialDocs", official_vs, official_bm25_comps),
+        ("Echanges", echanges_vs, echanges_bm25_comps),
+    ]
 
-    # 4. Interroger le Vector Store des Échanges (k faible/moyen, pour style/exemples)
-    if echanges_vectore_store:
-        try:
-            relevant_echanges = echanges_vectore_store.similarity_search(question, k=3)
-            logger.info(f"Retrieve - {len(relevant_echanges)} échanges.")
-        except Exception as e: logger.error(f"Retrieve - Erreur recherche echanges_vector_store: {e}", exc_info=True)
-    else: logger.warning("Retrieve - echanges_vector_store non disponible.")
+    results_dict = {}
+    logger.info(f"Lancement de la récupération parallèle pour {len(tasks)} sources avec max_workers={max_workers}...")
+    # Exécution parallèle
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Soumettre les tâches
+        future_to_source = {executor.submit(get_hybrid_docs_for_source, name, vs, bm25): name for name, vs, bm25 in tasks}
+        
+        # Récupérer les résultats au fur et à mesure qu'ils sont complétés
+        for future in concurrent.futures.as_completed(future_to_source):
+            source_name_res = future_to_source[future]
+            try:
+                name, docs = future.result()
+                results_dict[name] = docs
+                logger.info(f"Récupération parallèle terminée pour: {name}")
+            except Exception as exc:
+                logger.error(f"Erreur lors de la récupération parallèle pour {source_name_res}: {exc}", exc_info=True)
+                results_dict[source_name_res] = [] # Assurer une liste vide en cas d'erreur
 
-     # 5. Combiner les résultats dans l'ordre de priorité pour le LLM: BDD > Règles > Officiels > Échanges
-    combined_docs = db_docs + relevant_rules + relevant_official_docs +  relevant_user_docs + relevant_echanges
-    
+    logger.info("Récupération parallèle terminée pour toutes les sources.")
+
+    # Récupérer les résultats dans l'ordre souhaité
+    relevant_user_docs = results_dict.get("UserDocs", [])
+    relevant_rules = results_dict.get("Rules", [])
+    relevant_official_docs = results_dict.get("OfficialDocs", [])
+    relevant_echanges = results_dict.get("Echanges", [])
+
+    # Combiner les résultats dans l'ordre de priorité: BDD > Règles > Officiels > User > Échanges
+    combined_docs = (
+        db_docs + 
+        relevant_rules + 
+        relevant_official_docs + 
+        relevant_user_docs + 
+        relevant_echanges
+    )
     logger.info(f"Retrieve - Documents combinés avant déduplication: {len(combined_docs)} "
                 f"(BDD: {len(db_docs)}, Règles: {len(relevant_rules)}, "
-                f"Officiels: {len(relevant_official_docs)}, Echanges: {len(relevant_echanges)})")
-    
-    # 6. Déduplication simple basée sur le contenu exact 
+                f"Officiels: {len(relevant_official_docs)}, User: {len(relevant_user_docs)}, Echanges: {len(relevant_echanges)})")
+
+    # Déduplication simple basée sur le contenu exact 
     seen_content = set()
     unique_docs = []
     for doc in combined_docs:
@@ -256,7 +329,9 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
         "4.  **FORMAT ET STYLE:**\n"
         "    - Adresse-toi à l'agent instructeur.\n"
         "    - Style: Formel, institutionnel, clair, concis.\n"
-        "    - Formatage Markdown: Utilise **gras**, *italique*, listes à puces/numérotées, `### Titres` pour structurer.\n"
+        "    - Formatage Markdown: Utilise **gras**, *italique*, listes à puces/numérotées, et des titres (`## Titre` ou `### Sous-titre`) pour structurer clairement ta réponse. Préserve la structure hiérarchique si elle existe dans le contexte (par exemple, les différentes catégories de projets).\n"
+        "    - Tableaux: Si le contexte contient des données sous forme de tableau pertinentes pour la question (par exemple, conditions, éligibilité/inéligibilité, codes APE, montants), tu DOIS présenter ces données sous forme de tableau Markdown dans ta réponse. Inclus TOUTES les colonnes et lignes pertinentes du tableau source. Assure-toi explicitement que les colonnes comme 'Code APE' sont présentes si elles le sont dans la source.\n"
+        "    - Exhaustivité: Synthétise TOUTES les informations pertinentes du contexte pour répondre complètement à la question. Ne résume pas de manière excessive si cela omet des détails importants ou des catégories entières présentes dans le contexte.\n"
         "    - Citations: Justifie les points clés en citant la source exacte `[SOURCE X]`. Si multiple: `[SOURCE 1, SOURCE 3]`.\n"
         "5.  **INTERDICTIONS:**\n"
         "    - Ne mentionne jamais que tu es une IA ou un chatbot.\n"
@@ -294,7 +369,8 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
                     {"role": "user", "content": user_prompt}]
         
         # Utilise llm_model passé en argument
-        response = llm_model.invoke(messages, temperature=0.1, max_tokens=2000)
+        #response = llm_model.invoke(messages, temperature=0.1, max_tokens=2000)
+        response = llm_model.invoke(messages)
         final_answer = response.content
         logger.info("Génération - Réponse LLM reçue.")
         return {"answer": final_answer}
@@ -304,24 +380,44 @@ def generate(state: State, llm_model: Optional[Any]) -> Dict[str, Any]:
 
 
 def build_graph_with_deps(
-    db_man_dep: Optional[Any], 
+    db_man_dep: Optional[Any],
     db_conn_status_dep: bool,
-    llm_dep: Optional[Any],     
+    llm_dep: Optional[Any],
+    # FAISS VectorStores
     rules_vs_dep: Optional[VectorStore],
     official_vs_dep: Optional[VectorStore],
     echanges_vs_dep: Optional[VectorStore],
-    user_vs_dep: Optional[VectorStore]
-) -> StateGraph: 
-    """Construit et compile le graphe LangGraph en liant les dépendances."""
-    logger.info("Construction du graphe RAG avec dépendances...")
+    user_vs_dep: Optional[VectorStore],
+    # BM25 Components
+    rules_bm25_comps_dep: BM25Components,
+    official_bm25_comps_dep: BM25Components,
+    echanges_bm25_comps_dep: BM25Components,
+    user_bm25_comps_dep: BM25Components,
+    # Configuration pour la recherche (optionnel, avec des valeurs par défaut dans retrieve)
+    k_faiss_dep: int = 3,
+    k_bm25_dep: int = 3,
+    ensemble_weights_dep: Optional[List[float]] = None,
+    max_workers_dep: int = 4 # Ajout du paramètre pour le nombre de workers
+) -> StateGraph:
+    """Construit et compile le graphe LangGraph en liant les dépendances, y compris BM25."""
+    logger.info("Construction du graphe RAG avec dépendances (FAISS + BM25)...")
     workflow = StateGraph(State)
 
-   
     bound_search_database = partial(search_database, db_manager=db_man_dep, db_conn_status_val=db_conn_status_dep)
-    bound_retrieve = partial(retrieve,rules_vectore_store=rules_vs_dep, official_vectore_store=official_vs_dep, echanges_vectore_store=echanges_vs_dep, user_vectore_store=user_vs_dep)
+    
+    # Lier toutes les nouvelles dépendances à la fonction retrieve, y compris max_workers
+    bound_retrieve = partial(
+        retrieve,
+        rules_vs=rules_vs_dep, official_vs=official_vs_dep, 
+        echanges_vs=echanges_vs_dep, user_vs=user_vs_dep,
+        rules_bm25_comps=rules_bm25_comps_dep, official_bm25_comps=official_bm25_comps_dep,
+        echanges_bm25_comps=echanges_bm25_comps_dep, user_bm25_comps=user_bm25_comps_dep,
+        k_faiss=k_faiss_dep, k_bm25=k_bm25_dep, ensemble_weights=ensemble_weights_dep,
+        max_workers=max_workers_dep # Passer le nombre de workers
+    )
     bound_generate = partial(generate, llm_model=llm_dep)
 
-    # Ajout des noeuds 
+    # Ajout des noeuds
     workflow.add_node("search_database", bound_search_database)
     workflow.add_node("retrieve", bound_retrieve)
     workflow.add_node("generate", bound_generate)

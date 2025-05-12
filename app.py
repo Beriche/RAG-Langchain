@@ -274,8 +274,8 @@ with st.sidebar:
                         logger.info(f"Fichier sauvegardé: {file_path}")
                 
                 # Appeler une fonction pour (re)construire le vector store utilisateur
-                if st.session_state.rag_components and callable(st.session_state.rag_components.get("update_user_vector_store")):
-                    update_user_vs_func = st.session_state.rag_components.get("update_user_vector_store")
+                if st.session_state.rag_components and callable(st.session_state.rag_components.get("update_user_retrieval")): # Clé corrigée
+                    update_user_vs_func = st.session_state.rag_components.get("update_user_retrieval") # Clé corrigée
                     
                     with st.spinner("Mise à jour de la base de connaissance utilisateur..."):
                         success_update = update_user_vs_func()
